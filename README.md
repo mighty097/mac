@@ -1,4 +1,6 @@
-# SnowfallMac — macOS snow overlay prototype
+# SnowfallMac v0.2.1 — macOS snow overlay prototype
+
+> Project-file fix: добавлен обязательный `isa = XCBuildConfiguration;` в Release-конфигурацию. Это исправляет ошибку `missing required key 'isa'` при разборе `.xcodeproj`.
 
 Нативный прототип на Swift/AppKit. Рисует снег в прозрачном оконном слое, не должен перехватывать клики мыши, показывает управление в строке меню.
 

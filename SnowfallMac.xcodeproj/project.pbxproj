@@ -167,6 +167,7 @@
 			name = Debug;
 		};
 		F10000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				ENABLE_APP_SANDBOX = NO;
