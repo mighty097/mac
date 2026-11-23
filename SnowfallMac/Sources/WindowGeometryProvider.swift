@@ -1,5 +1,7 @@
 import AppKit
 import CoreGraphics
+import ApplicationServices
+import CoreFoundation
 
 struct WindowSurfaceInfo {
     let windowID: CGWindowID
@@ -70,4 +72,130 @@ enum WindowGeometryProvider {
         }
         return results
     }
+
+    // MARK: Dock geometry via Accessibility
+
+    private static var dockAXCacheDate: TimeInterval = 0
+    private static var dockAXCacheWasRead = false
+    private static var cachedDockAXFrame: CGRect?
+
+    /// Returns the bottom Dock panel as a rectangle local to this display.
+    /// The AXList describes the actual Dock strip; full-screen Dock helper
+    /// windows from CGWindowList are intentionally not used as geometry.
+    static func dockSurfaceFrame(on screen: NSScreen) -> CGRect? {
+        guard let axFrame = currentDockAXFrame(),
+              let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+
+        let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+        let quartzDisplayFrame = CGDisplayBounds(displayID)
+        guard quartzDisplayFrame.width > 0, quartzDisplayFrame.height > 0 else { return nil }
+
+        // kAXPositionAttribute and CGDisplayBounds both use global top-left
+        // coordinates. SnowfallMac's NSView uses local bottom-left coordinates.
+        let localFrame = CGRect(
+            x: axFrame.minX - quartzDisplayFrame.minX,
+            y: quartzDisplayFrame.maxY - axFrame.maxY,
+            width: axFrame.width,
+            height: axFrame.height
+        )
+        let displayBounds = CGRect(origin: .zero, size: screen.frame.size)
+        let clipped = localFrame.intersection(displayBounds)
+        guard !clipped.isNull, !clipped.isEmpty else { return nil }
+
+        // This implementation intentionally recognizes a horizontal Dock at
+        // the bottom edge. It rejects the full-display helper window and other
+        // unrelated AX lists. Side/top Dock layouts can be added separately.
+        guard clipped.minY <= 100,
+              clipped.maxY <= 220,
+              clipped.width >= max(160, displayBounds.width * 0.15),
+              clipped.width <= displayBounds.width * 0.95,
+              clipped.height >= 28,
+              clipped.height <= 180 else {
+            return nil
+        }
+        return clipped
+    }
+
+    private static func currentDockAXFrame() -> CGRect? {
+        let now = ProcessInfo.processInfo.systemUptime
+        if dockAXCacheWasRead, now - dockAXCacheDate < 1.0 {
+            return cachedDockAXFrame
+        }
+        dockAXCacheWasRead = true
+        dockAXCacheDate = now
+        cachedDockAXFrame = nil
+
+        // Accessibility permission is per process. Terminal permission used
+        // by the diagnostic script does not automatically authorize the app.
+        guard AXIsProcessTrusted(),
+              let dock = NSRunningApplication.runningApplications(
+                withBundleIdentifier: "com.apple.dock"
+              ).first else {
+            return nil
+        }
+
+        let application = AXUIElementCreateApplication(dock.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.25)
+        var candidates: [CGRect] = []
+        var visited = 0
+
+        func readAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+            return error == .success ? value : nil
+        }
+
+        func readFrame(_ element: AXUIElement) -> CGRect? {
+            guard let positionRef = readAttribute(element, "AXPosition"),
+                  let sizeRef = readAttribute(element, "AXSize"),
+                  CFGetTypeID(positionRef) == AXValueGetTypeID(),
+                  CFGetTypeID(sizeRef) == AXValueGetTypeID() else {
+                return nil
+            }
+            let positionValue = positionRef as! AXValue
+            let sizeValue = sizeRef as! AXValue
+            var position = CGPoint.zero
+            var size = CGSize.zero
+            guard AXValueGetValue(positionValue, .cgPoint, &position),
+                  AXValueGetValue(sizeValue, .cgSize, &size),
+                  size.width > 0, size.height > 0 else {
+                return nil
+            }
+            return CGRect(origin: position, size: size)
+        }
+
+        func walk(_ element: AXUIElement, depth: Int) {
+            guard visited < 250, depth <= 6 else { return }
+            visited += 1
+
+            if let role = readAttribute(element, "AXRole") as? String,
+               role == "AXList",
+               let frame = readFrame(element),
+               frame.width >= 160,
+               frame.height >= 28,
+               frame.height <= 180 {
+                candidates.append(frame)
+            }
+
+            guard let childrenValue = readAttribute(element, "AXChildren"),
+                  let children = childrenValue as? [AXUIElement] else {
+                return
+            }
+            for child in children {
+                walk(child, depth: depth + 1)
+                if visited >= 250 { break }
+            }
+        }
+
+        walk(application, depth: 0)
+        // The Dock's primary AXList is the broadest candidate; individual
+        // AXDockItem rectangles are deliberately not treated as separate ledges.
+        cachedDockAXFrame = candidates.max {
+            ($0.width * $0.height) < ($1.width * $1.height)
+        }
+        return cachedDockAXFrame
+    }
+
 }
