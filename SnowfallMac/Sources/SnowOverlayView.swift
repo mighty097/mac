@@ -44,12 +44,17 @@ private final class SnowPile {
     var lastSurface: SnowSurface
     var fresh: [CGFloat]
     var packed: [CGFloat]
+    var lastSeenAt: TimeInterval
+    var pendingMovementX: CGFloat = 0
+    var pendingMovementY: CGFloat = 0
+    var pendingMovementDistance: CGFloat = 0
 
-    init(surface: SnowSurface, binCount: Int) {
+    init(surface: SnowSurface, binCount: Int, now: TimeInterval) {
         lastFrame = surface.frame
         lastSurface = surface
         fresh = Array(repeating: 0, count: max(1, binCount))
         packed = Array(repeating: 0, count: max(1, binCount))
+        lastSeenAt = now
     }
 
     var count: Int { min(fresh.count, packed.count) }
@@ -101,7 +106,8 @@ final class SnowOverlayView: NSView {
 
     private let screen: NSScreen
     private let binWidth: CGFloat = 4
-    private let maximumBurstFlakes = 520
+    private let missingSurfaceGracePeriod: TimeInterval = 1.25
+    private let maximumBurstFlakes = 300
     private var maximumSnowHeight: CGFloat { max(8, intensity.maximumPileHeight) }
     private let baseWindStrength: CGFloat = 150
 
@@ -122,7 +128,7 @@ final class SnowOverlayView: NSView {
     private var lastHapticTime: TimeInterval = 0
     private var lastPowerCheck: TimeInterval = 0
     private var onBatteryPower = false
-    private var isClearing = false
+    private var clearFadeRemaining: CGFloat = 0
     private var isDisplayCovered = false
     private var didClearForFullScreen = false
 
@@ -201,7 +207,7 @@ final class SnowOverlayView: NSView {
 
     /// Gradually melts the piles instead of removing them in one frame.
     func clearSnow() {
-        isClearing = true
+        clearFadeRemaining = 1.25
         for pile in piles.values {
             for index in 0..<pile.count {
                 let removed = pile.fresh[index] * 0.72
@@ -357,7 +363,7 @@ final class SnowOverlayView: NSView {
                 wobbleAmplitude: CGFloat.random(in: 3...8),
                 spriteIndex: sprite,
                 depth: 0.88,
-                life: CGFloat.random(in: 1.5...3.4),
+                life: CGFloat.random(in: 18...28),
                 sourceSurfaceID: sourceSurfaceID
             ))
         }
@@ -414,17 +420,19 @@ final class SnowOverlayView: NSView {
         }
 
         if accumulateOnBottom {
-            let dockTop = max(0, screen.visibleFrame.minY - screen.frame.minY)
-            if dockTop > 18 {
-                updated.append(SnowSurface(
-                    id: -1,
-                    frame: CGRect(x: 0, y: dockTop, width: bounds.width, height: 4),
-                    supportY: dockTop,
+            // Dock is a real, limited-width support from its Accessibility AXList
+            // bounds, not a synthetic shelf spanning the entire display.
+            if let dockFrame = WindowGeometryProvider.dockSurfaceFrame(on: screen) {
+                updated.insert(SnowSurface(
+                    id: -3,
+                    frame: dockFrame,
+                    supportY: dockFrame.maxY,
                     ownerName: "Dock",
-                    isBottomEdge: true,
-                    isTarget: true
-                ))
+                    isBottomEdge: false,
+                    isTarget: !finderOnly
+                ), at: 0)
             }
+
             updated.append(SnowSurface(
                 id: -2,
                 frame: CGRect(x: 0, y: 0, width: bounds.width, height: 4),
@@ -441,6 +449,7 @@ final class SnowOverlayView: NSView {
     }
 
     private func syncPilesWithSurfaces() {
+        let now = ProcessInfo.processInfo.systemUptime
         var activeIDs = Set<Int>()
 
         for surface in surfaces where surface.isTarget {
@@ -449,25 +458,52 @@ final class SnowOverlayView: NSView {
             let binCount = max(1, Int(ceil(usableWidth / binWidth)))
 
             if let pile = piles[surface.id] {
+                pile.lastSeenAt = now
                 let dx = surface.frame.minX - pile.lastFrame.minX
                 let dy = surface.frame.minY - pile.lastFrame.minY
-                let movement = hypot(dx, dy)
-                if movement > 1.5 {
-                    shedPile(pile, from: pile.lastSurface, movementX: dx, movementY: dy, ratio: min(0.92, movement / 95))
+                pile.pendingMovementX += dx
+                pile.pendingMovementY += dy
+                pile.pendingMovementDistance += hypot(dx, dy)
+
+                if pile.pendingMovementDistance >= 4 {
+                    let movementX = pile.pendingMovementX
+                    let movementY = pile.pendingMovementY
+                    let movementDistance = pile.pendingMovementDistance
+                    let sheddingRatio = min(0.30, max(0.0015, movementDistance / 2600))
+                    shedPile(
+                        pile,
+                        from: pile.lastSurface,
+                        movementX: movementX,
+                        movementY: movementY,
+                        ratio: sheddingRatio
+                    )
+                    pile.pendingMovementX = 0
+                    pile.pendingMovementY = 0
+                    pile.pendingMovementDistance = 0
                 }
+
                 pile.resize(to: binCount)
                 pile.lastFrame = surface.frame
                 pile.lastSurface = surface
             } else {
-                piles[surface.id] = SnowPile(surface: surface, binCount: binCount)
+                piles[surface.id] = SnowPile(surface: surface, binCount: binCount, now: now)
             }
         }
 
+        var temporarilyMissingSurfaces: [SnowSurface] = []
         for id in Array(piles.keys) where !activeIDs.contains(id) {
-            if let pile = piles.removeValue(forKey: id) {
-                shedPile(pile, from: pile.lastSurface, movementX: 0, movementY: 0, ratio: 1)
+            guard let pile = piles[id] else { continue }
+            if now - pile.lastSeenAt < missingSurfaceGracePeriod {
+                // Keep rendering/colliding against its last known position while
+                // CGWindowList temporarily omits a moving or animating window.
+                temporarilyMissingSurfaces.append(pile.lastSurface)
+                continue
             }
+
+            piles.removeValue(forKey: id)
+            shedPile(pile, from: pile.lastSurface, movementX: 0, movementY: 0, ratio: 1)
         }
+        surfaces.append(contentsOf: temporarilyMissingSurfaces)
     }
 
     private func isOccluded(_ point: CGPoint, before surfaceIndex: Int) -> Bool {
@@ -536,7 +572,7 @@ final class SnowOverlayView: NSView {
         }
         // A tiny amount of fresh powder compacts into a denser base over time.
         for index in 0..<pile.count {
-            let compaction = min(pile.fresh[index], 0.0018 * timeScale)
+            let compaction = min(pile.fresh[index], 0.00035 * timeScale)
             pile.fresh[index] -= compaction
             pile.packed[index] += compaction
         }
@@ -583,19 +619,20 @@ final class SnowOverlayView: NSView {
         guard ratio > 0 else { return }
         for index in 0..<pile.count {
             let height = pile.height(at: index)
-            guard height > 0.45 else { continue }
+            guard height > 0.12 else { continue }
             let removedFresh = pile.fresh[index] * ratio
-            let removedPacked = pile.packed[index] * ratio * 0.46
+            let packedRatio: CGFloat = ratio >= 0.999 ? 1 : ratio * 0.46
+            let removedPacked = pile.packed[index] * packedRatio
             let removed = removedFresh + removedPacked
             pile.fresh[index] -= removedFresh
             pile.packed[index] -= removedPacked
-            guard removed > 0.8 else { continue }
+            guard removed > 0.08 else { continue }
 
             let x = surface.left + (CGFloat(index) + 0.5) * binWidth
             let y = surface.supportY + height * 0.55
-            let dx = movementX * 2.0
-            let dy = movementY * 1.15 - 24
-            let count = min(6, max(1, Int(removed / 3.5)))
+            let dx = max(-180, min(180, -movementX * 2.5))
+            let dy: CGFloat = -32
+            let count = min(6, max(1, Int(removed / 2.2)))
             spawnPowder(at: CGPoint(x: x, y: y), velocity: CGVector(dx: dx, dy: dy), count: count, sourceSurfaceID: surface.id)
         }
     }
@@ -630,7 +667,7 @@ final class SnowOverlayView: NSView {
 
         let speed = min(1200, distanceTravelled / max(dt, 0.001))
         let brushRadius = min(44, 22 + distanceTravelled * 0.22)
-        let stepCount = max(1, min(100, Int(ceil(distanceTravelled / 5))))
+        let stepCount = max(1, min(24, Int(ceil(distanceTravelled / 8))))
         let swipeVelocity = CGVector(dx: dx / max(dt, 0.001) * 0.16, dy: dy / max(dt, 0.001) * 0.13)
         var removedVolume: CGFloat = 0
 
@@ -643,6 +680,11 @@ final class SnowOverlayView: NSView {
                   minMouseY <= surface.supportY + maxPile + brushRadius else { continue }
 
             var changed = false
+            var particleWeight: CGFloat = 0
+            var particleX: CGFloat = 0
+            var particleY: CGFloat = 0
+            var particleVelocityX: CGFloat = 0
+            var particleVelocityY: CGFloat = 0
             let sampleCount = max(1, stepCount)
             for sample in 0...sampleCount {
                 let t = CGFloat(sample) / CGFloat(sampleCount)
@@ -683,10 +725,22 @@ final class SnowOverlayView: NSView {
                             dx: swipeVelocity.dx * 0.45 + swirl.dx,
                             dy: swipeVelocity.dy * 0.30 + swirl.dy - 18
                         )
-                        let particleCount = removed > 4 ? 3 : 1
-                        spawnPowder(at: CGPoint(x: x, y: surface.supportY + total * 0.68), velocity: velocity, count: particleCount, sourceSurfaceID: surface.id)
+                        particleWeight += removed
+                        particleX += x * removed
+                        particleY += (surface.supportY + total * 0.68) * removed
+                        particleVelocityX += velocity.dx * removed
+                        particleVelocityY += velocity.dy * removed
                     }
                 }
+            }
+            if particleWeight > 1.0 {
+                let center = CGPoint(x: particleX / particleWeight, y: particleY / particleWeight)
+                let velocity = CGVector(
+                    dx: particleVelocityX / particleWeight,
+                    dy: particleVelocityY / particleWeight
+                )
+                let particleCount = min(5, max(1, Int(particleWeight / 3.5)))
+                spawnPowder(at: center, velocity: velocity, count: particleCount, sourceSurfaceID: surface.id)
             }
             if changed { relaxPile(pile, deltaTime: dt) }
 
@@ -758,8 +812,8 @@ final class SnowOverlayView: NSView {
 
         updateAmbientFlakes(deltaTime: dt)
         updateBurstFlakes(deltaTime: dt)
-        let freshMeltFactor = exp(-dt * 0.004)
-        let packedMeltFactor = exp(-dt * 0.0012)
+        let freshMeltFactor = exp(-dt * 0.0008)
+        let packedMeltFactor = exp(-dt * 0.00018)
         for pile in piles.values {
             relaxPile(pile, deltaTime: dt)
             spillPileEdges(pile, deltaTime: dt)
@@ -768,16 +822,16 @@ final class SnowOverlayView: NSView {
                 pile.packed[index] *= packedMeltFactor
             }
         }
-        if isClearing {
-            let fade = exp(-dt * 2.6)
+        if clearFadeRemaining > 0 {
+            let fadeTime = min(dt, clearFadeRemaining)
+            let fade = exp(-fadeTime * 2.6)
             for pile in piles.values {
                 for index in 0..<pile.count {
                     pile.fresh[index] *= fade
                     pile.packed[index] *= fade
                 }
             }
-            let remaining = piles.values.reduce(CGFloat.zero) { $0 + $1.totalHeight() }
-            if remaining < 0.35 { isClearing = false }
+            clearFadeRemaining = max(0, clearFadeRemaining - fadeTime)
         }
         updateMetalParticles()
         needsDisplay = true
@@ -862,8 +916,15 @@ final class SnowOverlayView: NSView {
                 continue
             }
 
-            if flake.life <= 0 || flake.position.y < -40
-                || flake.position.x < -80 || flake.position.x > bounds.width + 80 {
+            if flake.position.x < -12 {
+                flake.position.x = -12
+                flake.velocity.dx = abs(flake.velocity.dx) * 0.35
+            } else if flake.position.x > bounds.width + 12 {
+                flake.position.x = bounds.width + 12
+                flake.velocity.dx = -abs(flake.velocity.dx) * 0.35
+            }
+
+            if flake.life <= 0 || flake.position.y < -40 {
                 burstFlakes.remove(at: index)
             } else {
                 burstFlakes[index] = flake
