@@ -17,32 +17,32 @@ enum SnowIntensity: Int, CaseIterable {
     var spawnChancePerFrame: CGFloat {
         switch self {
         case .light: return 0.18
-        case .normal: return 0.42
-        case .heavy: return 0.85
+        case .normal: return 0.46
+        case .heavy: return 0.90
         }
     }
 
     var maximumParticles: Int {
         switch self {
-        case .light: return 100
-        case .normal: return 220
-        case .heavy: return 420
+        case .light: return 130
+        case .normal: return 280
+        case .heavy: return 480
         }
     }
 
     var maximumPileHeight: CGFloat {
         switch self {
-        case .light: return 9
-        case .normal: return 16
-        case .heavy: return 25
+        case .light: return 14
+        case .normal: return 24
+        case .heavy: return 38
         }
     }
 
     var fallSpeed: ClosedRange<CGFloat> {
         switch self {
-        case .light: return 17...34
-        case .normal: return 24...49
-        case .heavy: return 35...72
+        case .light: return 22...38
+        case .normal: return 30...55
+        case .heavy: return 42...76
         }
     }
 }
