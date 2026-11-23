@@ -65,7 +65,7 @@ enum WindowGeometryProvider {
             results.append(WindowSurfaceInfo(
                 windowID: windowID,
                 ownerName: ownerName,
-                frame: cocoaRect.offsetBy(dx: -cocoaDisplayFrame.minX, dy: -cocoaDisplayFrame.minY)
+                frame: clipped.offsetBy(dx: -cocoaDisplayFrame.minX, dy: -cocoaDisplayFrame.minY)
             ))
         }
         return results
