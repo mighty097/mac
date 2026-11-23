@@ -794,7 +794,7 @@ final class SnowOverlayView: NSView {
             flake.velocity.dx += (curl.dx + globalWind * flake.depth + sin(flake.phase) * flake.wobbleAmplitude) * dt
             flake.velocity.dx *= exp(-0.28 * dt)
             flake.velocity.dx = min(42, max(-42, flake.velocity.dx))
-            let targetFallSpeed = flake.depth < 0.6 ? 25 : (flake.depth < 0.85 ? 36 : 48)
+            let targetFallSpeed: CGFloat = flake.depth < 0.6 ? 25 : (flake.depth < 0.85 ? 36 : 48)
             let verticalSpeedError = -targetFallSpeed - flake.velocity.dy
             let verticalResponse = min(CGFloat(1), dt * CGFloat(0.75))
             flake.velocity.dy += verticalSpeedError * verticalResponse
@@ -1031,7 +1031,7 @@ final class SnowOverlayView: NSView {
             let smallRidge = sin(CGFloat(index) * 1.73 + CGFloat(surface.id) * 0.11) * 0.42
             crestPoints.append(CGPoint(x: centerX, y: supportY + height + smallRidge))
         }
-        guard let first = crestPoints.first, let last = crestPoints.last else { return }
+        guard let first = crestPoints.first else { return }
 
         let path = CGMutablePath()
         // Rounded ends, and a slight soft lip that sits over the window's top border.
