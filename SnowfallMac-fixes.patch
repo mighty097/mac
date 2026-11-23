@@ -1,0 +1,143 @@
+diff --git a/SnowfallMac/Sources/SnowOverlayView.swift b/SnowfallMac/Sources/SnowOverlayView.swift
+index 5cf0646..working 100644
+--- a/SnowfallMac/Sources/SnowOverlayView.swift
++++ b/SnowfallMac/Sources/SnowOverlayView.swift
+@@ -424,6 +424,5 @@ final class SnowOverlayView: NSView {
+                 }
+                 pile.resize(to: binCount)
+-                relaxPile(pile)
+                 pile.lastFrame = surface.frame
+                 pile.lastSurface = surface
+             } else {
+@@ -480,30 +479,65 @@ final class SnowOverlayView: NSView {
+         }
+     }
+ 
+-    private func relaxPile(_ pile: SnowPile) {
++    private func relaxPile(_ pile: SnowPile, deltaTime dt: CGFloat) {
+         guard pile.count > 2 else { return }
+-        // Avalanche relaxation: transfer only enough snow to keep a natural repose slope.
++        // Avalanche relaxation is time-based, so the result does not depend on frame rate.
+         let maxSlope: CGFloat = 1.45
++        let frameScale = min(3, max(0, dt * 60))
+         for index in 0..<(pile.count - 1) {
+             let left = pile.height(at: index)
+             let right = pile.height(at: index + 1)
+             let difference = left - right
+             if difference > maxSlope {
+-                let transfer = (difference - maxSlope) * 0.18
++                let transfer = (difference - maxSlope) * 0.18 * frameScale
+                 let loose = min(pile.fresh[index], transfer)
+                 pile.fresh[index] -= loose
+                 pile.fresh[index + 1] += loose
+             } else if difference < -maxSlope {
+-                let transfer = (abs(difference) - maxSlope) * 0.18
++                let transfer = (abs(difference) - maxSlope) * 0.18 * frameScale
+                 let loose = min(pile.fresh[index + 1], transfer)
+                 pile.fresh[index + 1] -= loose
+                 pile.fresh[index] += loose
+             }
+         }
+-        // A tiny amount of fresh powder compacts into a denser base over time.
++
++        // At an exposed edge, loose snow eventually rolls off instead of forming
++        // an infinitely stable vertical wall. The removed mass becomes falling powder.
++        let edgeIndices = [(index: 0, direction: CGFloat(-1)), (index: pile.count - 1, direction: CGFloat(1))]
++        for edge in edgeIndices {
++            let neighborIndex = edge.index == 0 ? 1 : pile.count - 2
++            let excess = pile.height(at: edge.index) - pile.height(at: neighborIndex) - maxSlope
++            guard excess > 0 else { continue }
++
++            let spilled = min(pile.fresh[edge.index], excess * 0.10 * frameScale)
++            guard spilled > 0.025 else { continue }
++            pile.fresh[edge.index] -= spilled
++
++            let x = edge.index == 0 ? pile.lastSurface.left : pile.lastSurface.right
++            let y = pile.lastSurface.supportY + pile.height(at: edge.index) * 0.55
++            let particleCount = min(3, max(1, Int(ceil(spilled / 0.35))))
++            spawnPowder(
++                at: CGPoint(x: x, y: y),
++                velocity: CGVector(dx: edge.direction * 24, dy: -22),
++                count: particleCount,
++                sourceSurfaceID: pile.lastSurface.id
++            )
++        }
++
++        // A small amount of fresh powder compacts each second, not each frame.
+         for index in 0..<pile.count {
+-            let compaction = min(pile.fresh[index], 0.0018)
++            let compaction = min(pile.fresh[index], dt * 0.018)
+             pile.fresh[index] -= compaction
+             pile.packed[index] += compaction
+         }
+     }
++
++    private func meltPile(_ pile: SnowPile, deltaTime dt: CGFloat) {
++        // Fresh snow melts faster; packed snow keeps its shape longer.
++        let freshRetention = exp(-dt * 0.0035)
++        let packedRetention = exp(-dt * 0.0010)
++        for index in 0..<pile.count {
++            pile.fresh[index] *= freshRetention
++            pile.packed[index] *= packedRetention
++        }
++    }
+@@ -650,2 +699,1 @@ final class SnowOverlayView: NSView {
+-            var changed = false
+             let sampleCount = max(1, stepCount)
+@@ -684,5 +732,4 @@ final class SnowOverlayView: NSView {
+                     pile.packed[index] = max(0, pile.packed[index] - packedRemoved)
+                     removedVolume += removed
+-                    changed = true
+ 
+                     if removed > 0.55 {
+@@ -701,5 +748,4 @@ final class SnowOverlayView: NSView {
+                 }
+             }
+-            if changed { relaxPile(pile) }
+ 
+             // The surface array is top-to-bottom: a top window protects piles behind it.
+@@ -768,5 +814,6 @@ final class SnowOverlayView: NSView {
+         updateAmbientFlakes(deltaTime: dt)
+         updateBurstFlakes(deltaTime: dt)
+         for pile in piles.values {
+-            relaxPile(pile)
++            relaxPile(pile, deltaTime: dt)
++            meltPile(pile, deltaTime: dt)
+         }
+@@ -784,4 +833,5 @@ final class SnowOverlayView: NSView {
+             if remaining < 0.35 { isClearing = false }
+         }
+         needsDisplay = true
++        updateMetalParticles()
+     }
+@@ -808,4 +858,5 @@ final class SnowOverlayView: NSView {
+             flake.velocity.dx = min(42, max(-42, flake.velocity.dx))
+             let targetFallSpeed = flake.depth < 0.6 ? 25 : (flake.depth < 0.85 ? 36 : 48)
+-            flake.velocity.dy += (-targetFallSpeed - flake.velocity.dy) * min(1, dt * 0.75)
++            let fallAdjustment: CGFloat = min(1, dt * 0.75)
++            flake.velocity.dy += (-targetFallSpeed - flake.velocity.dy) * fallAdjustment
+             flake.rotation += flake.rotationSpeed * dt
+@@ -1004,5 +1055,10 @@ final class SnowOverlayView: NSView {
+             let visibleHeights: [CGFloat] = (0..<pile.count).map { index in
+                 let x = surface.left + (CGFloat(index) + 0.5) * binWidth
+-                let probe = CGPoint(x: x, y: surface.supportY + 1.5)
+-                return !surface.isBottomEdge && isOccluded(probe, before: surfaceIndex) ? 0 : pile.height(at: index)
++                let height = pile.height(at: index)
++                let top = surface.supportY + height
++                let isCovered = !surface.isBottomEdge && surfaces[..<surfaceIndex].contains { upper in
++                    !upper.isBottomEdge && x >= upper.frame.minX && x <= upper.frame.maxX
++                        && upper.frame.maxY > surface.supportY && upper.frame.minY < top
++                }
++                return isCovered ? 0 : height
+             }
+@@ -1102,1 +1153,1 @@ final class SnowOverlayView: NSView {
+-        guard let first = crestPoints.first, let last = crestPoints.last else { return }
++        guard let first = crestPoints.first else { return }
+@@ -1253,7 +1304,6 @@ private final class SnowParticleMetalView: MTKView, MTKViewDelegate {
+         framebufferOnly = true
+         isPaused = true
+         enableSetNeedsDisplay = false
+-        isOpaque = false
+         wantsLayer = true
+         layer?.isOpaque = false
+         delegate = self
