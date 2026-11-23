@@ -34,9 +34,13 @@ enum WindowGeometryProvider {
             let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0
             guard alpha > 0.05 else { continue }
 
+            // CGWindowListCopyWindowInfo bridges each window entry to [String: Any].
+            // Read its bounds as NSDictionary first, then bridge explicitly to CFDictionary.
+            // `as? CFDictionary` directly from Any triggers a Swift compiler diagnostic
+            // in Xcode 16.4 because that CoreFoundation cast is considered always-successful.
             guard
-                let rawBounds = entry[kCGWindowBounds as String] as? CFDictionary,
-                let quartzRect = CGRect(dictionaryRepresentation: rawBounds),
+                let rawBounds = entry[kCGWindowBounds as String] as? NSDictionary,
+                let quartzRect = CGRect(dictionaryRepresentation: rawBounds as CFDictionary),
                 quartzRect.width > 90,
                 quartzRect.height > 45
             else {
