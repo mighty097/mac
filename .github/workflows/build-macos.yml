@@ -2,11 +2,15 @@ name: Build SnowfallMac
 
 on:
   push:
-    branches: [main, master]
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -52,7 +56,6 @@ jobs:
           import os
           import pathlib
           import re
-          import textwrap
 
           source = pathlib.Path("SnowfallMac/Sources/SnowOverlayView.swift").read_text()
           match = re.search(
@@ -63,6 +66,7 @@ jobs:
           if not match:
               raise SystemExit("Could not find embedded Metal shader")
 
+          import textwrap
           shader = textwrap.dedent(match.group(1)).strip() + "\n"
           output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "SnowfallParticles.metal"
           output.write_text(shader)
