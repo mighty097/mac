@@ -57,24 +57,26 @@ jobs:
           import pathlib
           import re
 
-          source = pathlib.Path("SnowfallMac/Sources/SnowOverlayView.swift").read_text()
-          match = re.search(
-              r'private static let spriteShader = """\n(.*?)\n    """',
-              source,
-              flags=re.S,
-          )
+          source = pathlib.Path("SnowfallMac/Sources/SnowRenderer.swift").read_text()
+          match = re.search(r'static let source = """\n(.*?)\n"""', source, flags=re.S)
           if not match:
               raise SystemExit("Could not find embedded Metal shader")
 
-          import textwrap
-          shader = textwrap.dedent(match.group(1)).strip() + "\n"
           output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "SnowfallParticles.metal"
-          output.write_text(shader)
+          output.write_text(match.group(1).strip() + "\n")
           print(f"Wrote {output}")
           PY
           xcrun -sdk macosx metal -c \
             "$RUNNER_TEMP/SnowfallParticles.metal" \
             -o "$RUNNER_TEMP/SnowfallParticles.air"
+
+      - name: Build with Swift Package Manager (the VS Code path)
+        run: |
+          set -euo pipefail
+          swift --version
+          ./build_app.sh
+          test -d dist/Snowfall.app
+          codesign --verify --deep --strict dist/Snowfall.app
 
       - name: Sign locally and package the app
         run: |

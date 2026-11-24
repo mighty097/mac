@@ -6,11 +6,11 @@ import IOKit.ps
 // MARK: - Rendering layers
 
 enum SnowRenderLayer {
-    case background // Behind normal application windows.
-    case foreground // Above windows: flakes, piles and mouse interaction.
+    case background // Behind normal application windows: distant, soft flakes only.
+    case foreground // Above windows: near flakes, snowdrifts and mouse interaction.
 }
 
-private struct Snowflake {
+struct SnowFlake {
     var position: CGPoint
     var velocity: CGVector
     var radius: CGFloat
@@ -20,41 +20,21 @@ private struct Snowflake {
     var rotationSpeed: CGFloat
     var wobbleSpeed: CGFloat
     var wobbleAmplitude: CGFloat
-    var spriteIndex: Int
     var depth: CGFloat
     var life: CGFloat // Negative means an ambient flake.
     var sourceSurfaceID: Int?
 }
 
-private struct SnowSurface {
-    let id: Int
-    let frame: CGRect
-    let supportY: CGFloat
-    let ownerName: String
-    let isBottomEdge: Bool
-    let isTarget: Bool
-
-    var cornerInset: CGFloat { isBottomEdge ? 0 : 12 }
-    var left: CGFloat { frame.minX + cornerInset }
-    var right: CGFloat { frame.maxX - cornerInset }
-}
-
-private final class SnowPile {
-    var lastFrame: CGRect
-    var lastSurface: SnowSurface
+/// Two height fields on one ledge: loose fresh powder on top of a slowly compacting base.
+final class SnowPile {
+    var surface: Surface
     var fresh: [CGFloat]
     var packed: [CGFloat]
-    var lastSeenAt: TimeInterval
-    var pendingMovementX: CGFloat = 0
-    var pendingMovementY: CGFloat = 0
-    var pendingMovementDistance: CGFloat = 0
 
-    init(surface: SnowSurface, binCount: Int, now: TimeInterval) {
-        lastFrame = surface.frame
-        lastSurface = surface
+    init(surface: Surface, binCount: Int) {
+        self.surface = surface
         fresh = Array(repeating: 0, count: max(1, binCount))
         packed = Array(repeating: 0, count: max(1, binCount))
-        lastSeenAt = now
     }
 
     var count: Int { min(fresh.count, packed.count) }
@@ -65,10 +45,10 @@ private final class SnowPile {
     }
 
     func resize(to newCount: Int) {
-        let count = max(1, newCount)
-        guard count != fresh.count else { return }
-        fresh = Self.resample(fresh, to: count)
-        packed = Self.resample(packed, to: count)
+        let target = max(1, newCount)
+        guard target != fresh.count else { return }
+        fresh = Self.resample(fresh, to: target)
+        packed = Self.resample(packed, to: target)
     }
 
     private static func resample(_ source: [CGFloat], to count: Int) -> [CGFloat] {
@@ -85,8 +65,15 @@ private final class SnowPile {
     }
 
     func totalHeight() -> CGFloat {
-        guard count > 0 else { return 0 }
-        return (0..<count).reduce(CGFloat.zero) { $0 + height(at: $1) }
+        var sum: CGFloat = 0
+        for index in 0..<count { sum += height(at: index) }
+        return sum
+    }
+
+    func maxHeight() -> CGFloat {
+        var best: CGFloat = 0
+        for index in 0..<count { best = max(best, height(at: index)) }
+        return best
     }
 }
 
@@ -96,41 +83,41 @@ final class SnowOverlayView: NSView {
     // MARK: Configuration exposed to the menu bar controller
 
     let renderLayer: SnowRenderLayer
+
     var intensity: SnowIntensity = .normal {
         didSet { resizeAmbientFlakes() }
     }
-    var finderOnly = false
-    var accumulateOnBottom = true
+
+    var finderOnly = false {
+        didSet { tracker.finderOnly = finderOnly }
+    }
 
     // MARK: Simulation state
 
     private let screen: NSScreen
+    private let tracker = SurfaceTracker()
     private let binWidth: CGFloat = 4
-    private let missingSurfaceGracePeriod: TimeInterval = 1.25
-    private let maximumBurstFlakes = 300
-    private var maximumSnowHeight: CGFloat { max(8, intensity.maximumPileHeight) }
+    private let maximumBurstFlakes = 420
     private let baseWindStrength: CGFloat = 150
+    private var maximumSnowHeight: CGFloat { max(8, intensity.maximumPileHeight) }
 
-    private var ambientFlakes: [Snowflake] = []
-    private var burstFlakes: [Snowflake] = []
-    private var surfaces: [SnowSurface] = [] // CGWindowList order: front to back.
+    private var ambientFlakes: [SnowFlake] = []
+    private var burstFlakes: [SnowFlake] = []
     private var piles: [Int: SnowPile] = [:]
-    private var flakeSprites: [CGImage] = []
-    private var lightDriftGradient: CGGradient?
-    private var darkDriftGradient: CGGradient?
-    private var metalParticleView: SnowParticleMetalView?
+    private var output = SnowFrameOutput()
+    private var metalView: SnowMetalView?
 
-    private var timer: Timer?
+    private var isRunning = false
     private var lastTick: TimeInterval = 0
     private var lastSurfaceScan: TimeInterval = 0
+    private var lastPowerCheck: TimeInterval = 0
     private var elapsed: CGFloat = 0
     private var previousMouse: CGPoint?
     private var lastHapticTime: TimeInterval = 0
-    private var lastPowerCheck: TimeInterval = 0
     private var onBatteryPower = false
+    private var lowPowerMode = false
     private var clearFadeRemaining: CGFloat = 0
-    private var isDisplayCovered = false
-    private var didClearForFullScreen = false
+    private var coveredTimer: Timer?
 
     private var isDarkAppearance: Bool {
         let appearance = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
@@ -143,16 +130,12 @@ final class SnowOverlayView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
-        buildFlakeSprites()
-        buildDriftGradient()
         resizeAmbientFlakes()
-        if let device = MTLCreateSystemDefaultDevice() {
-            let particleView = SnowParticleMetalView(frame: bounds, device: device)
-            if particleView.isRendererReady {
-                particleView.autoresizingMask = [.width, .height]
-                addSubview(particleView)
-                metalParticleView = particleView
-            }
+        if let view = SnowMetalView(size: frameRect.size) {
+            view.autoresizingMask = [.width, .height]
+            view.onFrame = { [weak self] in self?.tick() }
+            addSubview(view)
+            metalView = view
         }
     }
 
@@ -163,46 +146,38 @@ final class SnowOverlayView: NSView {
     override var isFlipped: Bool { false }
 
     deinit {
-        timer?.invalidate()
+        coveredTimer?.invalidate()
     }
 
-    // MARK: Public lifecycle
+    // MARK: Lifecycle
 
     func start() {
-        guard timer == nil else { return }
-        lastTick = ProcessInfo.processInfo.systemUptime
-        lastPowerCheck = lastTick
-        onBatteryPower = isOnBatteryPower()
+        guard !isRunning else { return }
+        isRunning = true
+        let now = ProcessInfo.processInfo.systemUptime
+        lastTick = now
+        lastPowerCheck = now
+        previousMouse = nil
+        refreshPowerState(force: true)
         resizeAmbientFlakes()
         if renderLayer == .foreground {
-            refreshSurfaces()
-            lastSurfaceScan = lastTick
+            scanSurfaces(now: now)
+            lastSurfaceScan = now
         }
-        scheduleTimer()
-    }
-
-    private func scheduleTimer() {
-        timer?.invalidate()
-        let displayFPS = min(120, max(60, screen.maximumFramesPerSecond))
-        let targetFPS = onBatteryPower ? 30 : displayFPS
-        metalParticleView?.preferredFramesPerSecond = targetFPS
-        let interval = 1.0 / Double(targetFPS)
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        if let timer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
+        metalView?.preferredFramesPerSecond = targetFramesPerSecond
+        metalView?.isPaused = false
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        isRunning = false
+        coveredTimer?.invalidate()
+        coveredTimer = nil
+        metalView?.isPaused = true
         ambientFlakes.removeAll(keepingCapacity: true)
         burstFlakes.removeAll(keepingCapacity: true)
-        metalParticleView?.update(particles: [])
-        metalParticleView?.draw()
-        needsDisplay = true
+        output.reset()
+        metalView?.submit(output)
+        metalView?.draw() // Clears the last frame.
     }
 
     /// Gradually melts the piles instead of removing them in one frame.
@@ -215,74 +190,54 @@ final class SnowOverlayView: NSView {
                 pile.packed[index] = max(0, pile.packed[index] - pile.packed[index] * 0.16)
             }
         }
-        needsDisplay = true
     }
 
-    // MARK: Soft sprite generation
+    // MARK: Power management
 
-    private func buildFlakeSprites() {
-        let specifications: [(size: Int, blobs: [(x: CGFloat, y: CGFloat, r: CGFloat, alpha: CGFloat)])] = [
-            (32, [(0.48, 0.48, 0.48, 0.92), (0.28, 0.34, 0.18, 0.42)]),
-            (48, [(0.50, 0.50, 0.48, 0.95), (0.31, 0.43, 0.22, 0.48), (0.68, 0.60, 0.20, 0.36)]),
-            (64, [(0.50, 0.50, 0.49, 0.85), (0.31, 0.39, 0.25, 0.42), (0.69, 0.62, 0.22, 0.32), (0.49, 0.73, 0.16, 0.24)])
-        ]
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private var targetFramesPerSecond: Int {
+        let displayRate = min(120, max(60, screen.maximumFramesPerSecond))
+        if lowPowerMode { return 30 }
+        if onBatteryPower { return min(displayRate, 60) }
+        return displayRate
+    }
 
-        flakeSprites = specifications.compactMap { spec in
-            guard let context = CGContext(
-                data: nil,
-                width: spec.size,
-                height: spec.size,
-                bitsPerComponent: 8,
-                bytesPerRow: 0,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else { return nil }
+    /// On battery or in Low Power Mode the effect is half as dense.
+    private var powerScale: CGFloat {
+        (onBatteryPower || lowPowerMode) ? 0.5 : 1.0
+    }
 
-            for blob in spec.blobs {
-                let center = CGPoint(x: CGFloat(spec.size) * blob.x, y: CGFloat(spec.size) * blob.y)
-                let radius = CGFloat(spec.size) * blob.r * 0.5
-                let colors = [
-                    CGColor(colorSpace: colorSpace, components: [0.99, 0.995, 1.0, blob.alpha])!,
-                    CGColor(colorSpace: colorSpace, components: [0.94, 0.97, 1.0, blob.alpha * 0.44])!,
-                    CGColor(colorSpace: colorSpace, components: [0.90, 0.95, 1.0, 0.0])!
-                ] as CFArray
-                guard let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0, 0.48, 1]) else { continue }
-                context.drawRadialGradient(
-                    gradient,
-                    startCenter: center,
-                    startRadius: 0,
-                    endCenter: center,
-                    endRadius: radius,
-                    options: [.drawsAfterEndLocation]
-                )
-            }
-            return context.makeImage()
+    private func refreshPowerState(force: Bool) {
+        let battery = isOnBatteryPower()
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        guard force || battery != onBatteryPower || lowPower != lowPowerMode else { return }
+        onBatteryPower = battery
+        lowPowerMode = lowPower
+        resizeAmbientFlakes()
+        metalView?.preferredFramesPerSecond = targetFramesPerSecond
+    }
+
+    private func isOnBatteryPower() -> Bool {
+        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
+            return false
         }
-    }
-
-    private func buildDriftGradient() {
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let lightColors: [CGColor] = [
-            CGColor(colorSpace: colorSpace, components: [1.0, 1.0, 1.0, 0.98])!,
-            CGColor(colorSpace: colorSpace, components: [0.94, 0.97, 1.0, 0.96])!,
-            CGColor(colorSpace: colorSpace, components: [0.76, 0.84, 0.94, 0.92])!
-        ]
-        let darkColors: [CGColor] = [
-            CGColor(colorSpace: colorSpace, components: [0.90, 0.94, 1.0, 0.94])!,
-            CGColor(colorSpace: colorSpace, components: [0.76, 0.84, 0.96, 0.92])!,
-            CGColor(colorSpace: colorSpace, components: [0.48, 0.60, 0.78, 0.90])!
-        ]
-        lightDriftGradient = CGGradient(colorsSpace: colorSpace, colors: lightColors as CFArray, locations: [0, 0.52, 1])
-        darkDriftGradient = CGGradient(colorsSpace: colorSpace, colors: darkColors as CFArray, locations: [0, 0.52, 1])
+        for source in sources {
+            guard let description = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any] else {
+                continue
+            }
+            if let state = description[kIOPSPowerSourceStateKey] as? String,
+               state == kIOPSBatteryPowerValue {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: Particle creation and depth layers
 
     private func resizeAmbientFlakes() {
         let fraction: CGFloat = renderLayer == .background ? 0.36 : 0.64
-        let powerSaving: CGFloat = onBatteryPower ? 0.60 : 1.0
-        let target = max(28, Int(CGFloat(intensity.maximumParticles) * fraction * powerSaving))
+        let target = max(28, Int(CGFloat(intensity.maximumParticles) * fraction * powerScale))
         if ambientFlakes.count < target {
             for _ in ambientFlakes.count..<target {
                 ambientFlakes.append(makeAmbientFlake(randomY: true))
@@ -292,38 +247,38 @@ final class SnowOverlayView: NSView {
         }
     }
 
-    private func makeAmbientFlake(randomY: Bool) -> Snowflake {
+    private func makeAmbientFlake(randomY: Bool) -> SnowFlake {
         let roll = CGFloat.random(in: 0...1)
         let depth: CGFloat
         let radius: CGFloat
         let fallSpeed: CGFloat
         let alpha: CGFloat
-        let sprite: Int
 
         if renderLayer == .background {
             depth = CGFloat.random(in: 0.34...0.60)
             radius = CGFloat.random(in: 1.4...3.3)
             fallSpeed = CGFloat.random(in: intensity.fallSpeed) * 0.72
             alpha = CGFloat.random(in: 0.24...0.53)
-            sprite = 0
         } else if roll < 0.52 {
             depth = CGFloat.random(in: 0.58...0.78)
             radius = CGFloat.random(in: 3.1...5.5)
             fallSpeed = CGFloat.random(in: intensity.fallSpeed) * 0.90
             alpha = CGFloat.random(in: 0.48...0.78)
-            sprite = 1
         } else {
             depth = CGFloat.random(in: 0.79...1.05)
             radius = CGFloat.random(in: 5.0...9.5)
             fallSpeed = CGFloat.random(in: intensity.fallSpeed) * 1.08
             alpha = CGFloat.random(in: 0.36...0.72)
-            sprite = 2
         }
 
-        return Snowflake(
+        let startY: CGFloat = randomY
+            ? CGFloat.random(in: 0...max(bounds.height, 1))
+            : bounds.height + CGFloat.random(in: 12...60)
+
+        return SnowFlake(
             position: CGPoint(
                 x: CGFloat.random(in: -28...max(bounds.width + 28, 29)),
-                y: randomY ? CGFloat.random(in: 0...max(bounds.height, 1)) : bounds.height + CGFloat.random(in: 12...60)
+                y: startY
             ),
             velocity: CGVector(dx: CGFloat.random(in: -5...5), dy: -fallSpeed),
             radius: radius,
@@ -333,7 +288,6 @@ final class SnowOverlayView: NSView {
             rotationSpeed: CGFloat.random(in: -1.2...1.2),
             wobbleSpeed: CGFloat.random(in: 0.55...1.45),
             wobbleAmplitude: CGFloat.random(in: 3...11) * depth,
-            spriteIndex: min(sprite, max(0, flakeSprites.count - 1)),
             depth: depth,
             life: -1,
             sourceSurfaceID: nil
@@ -341,11 +295,9 @@ final class SnowOverlayView: NSView {
     }
 
     private func spawnPowder(at point: CGPoint, velocity: CGVector, count: Int, sourceSurfaceID: Int?) {
-        guard !flakeSprites.isEmpty else { return }
         for _ in 0..<count {
             guard burstFlakes.count < maximumBurstFlakes else { return }
-            let sprite = Int.random(in: 1..<flakeSprites.count)
-            burstFlakes.append(Snowflake(
+            burstFlakes.append(SnowFlake(
                 position: CGPoint(
                     x: point.x + CGFloat.random(in: -3...3),
                     y: point.y + CGFloat.random(in: -2...2)
@@ -361,7 +313,6 @@ final class SnowOverlayView: NSView {
                 rotationSpeed: CGFloat.random(in: -2.2...2.2),
                 wobbleSpeed: CGFloat.random(in: 0.8...1.8),
                 wobbleAmplitude: CGFloat.random(in: 3...8),
-                spriteIndex: sprite,
                 depth: 0.88,
                 life: CGFloat.random(in: 18...28),
                 sourceSurfaceID: sourceSurfaceID
@@ -393,148 +344,122 @@ final class SnowOverlayView: NSView {
 
     // MARK: Window and Dock surfaces
 
-    private func refreshSurfaces() {
+    private func scanSurfaces(now: TimeInterval) {
         guard renderLayer == .foreground else { return }
-        let windowInfos = WindowGeometryProvider.visibleWindowSurfaces(on: screen)
-        var updated: [SnowSurface] = []
-        var fullScreenWindowFound = false
-
-        for info in windowInfos {
-            let localFrame = info.frame
-            let isTarget = !finderOnly || info.ownerName == "Finder"
-            let surface = SnowSurface(
-                id: Int(info.windowID),
-                frame: localFrame,
-                supportY: localFrame.maxY,
-                ownerName: info.ownerName,
-                isBottomEdge: false,
-                isTarget: isTarget
-            )
-            updated.append(surface)
-
-            let nearFullScreen = localFrame.width >= bounds.width * 0.985
-                && localFrame.height >= bounds.height * 0.985
-                && abs(localFrame.minX) < 8
-                && abs(localFrame.minY) < 8
-            if nearFullScreen { fullScreenWindowFound = true }
-        }
-
-        if accumulateOnBottom {
-            // Dock is a real, limited-width support from its Accessibility AXList
-            // bounds, not a synthetic shelf spanning the entire display.
-            if let dockFrame = WindowGeometryProvider.dockSurfaceFrame(on: screen) {
-                updated.insert(SnowSurface(
-                    id: -3,
-                    frame: dockFrame,
-                    supportY: dockFrame.maxY,
-                    ownerName: "Dock",
-                    isBottomEdge: false,
-                    isTarget: !finderOnly
-                ), at: 0)
-            }
-
-            updated.append(SnowSurface(
-                id: -2,
-                frame: CGRect(x: 0, y: 0, width: bounds.width, height: 4),
-                supportY: 0,
-                ownerName: "Screen edge",
-                isBottomEdge: true,
-                isTarget: true
-            ))
-        }
-
-        surfaces = updated
-        isDisplayCovered = fullScreenWindowFound
-        syncPilesWithSurfaces()
+        let change = tracker.refresh(screen: screen, size: bounds.size, now: now)
+        syncPiles(with: change)
     }
 
-    private func syncPilesWithSurfaces() {
-        let now = ProcessInfo.processInfo.systemUptime
-        var activeIDs = Set<Int>()
+    private func syncPiles(with change: SurfaceChange) {
+        // 1. Moved windows: snow slides against the motion and part of it is shaken off.
+        for movement in change.moved {
+            guard let pile = piles[movement.previous.id] else { continue }
+            applyWindowMovement(movement, to: pile)
+        }
 
-        for surface in surfaces where surface.isTarget {
-            activeIDs.insert(surface.id)
-            let usableWidth = max(1, surface.right - surface.left)
-            let binCount = max(1, Int(ceil(usableWidth / binWidth)))
+        // 2. Closed windows lose all their snow.
+        for removedSurface in change.removed {
+            guard let pile = piles.removeValue(forKey: removedSurface.id) else { continue }
+            shedPile(pile, from: removedSurface, velocity: CGVector(dx: 0, dy: 0), ratio: 1)
+        }
 
+        // 3. Create or resize piles for the current surfaces.
+        var active = Set<Int>()
+        for surface in tracker.surfaces where surface.isTarget {
+            active.insert(surface.id)
+            let binCount = max(1, Int(ceil(surface.width / binWidth)))
             if let pile = piles[surface.id] {
-                pile.lastSeenAt = now
-                let dx = surface.frame.minX - pile.lastFrame.minX
-                let dy = surface.frame.minY - pile.lastFrame.minY
-                pile.pendingMovementX += dx
-                pile.pendingMovementY += dy
-                pile.pendingMovementDistance += hypot(dx, dy)
-
-                if pile.pendingMovementDistance >= 4 {
-                    let movementX = pile.pendingMovementX
-                    let movementY = pile.pendingMovementY
-                    let movementDistance = pile.pendingMovementDistance
-                    let sheddingRatio = min(0.30, max(0.0015, movementDistance / 2600))
-                    shedPile(
-                        pile,
-                        from: pile.lastSurface,
-                        movementX: movementX,
-                        movementY: movementY,
-                        ratio: sheddingRatio
-                    )
-                    pile.pendingMovementX = 0
-                    pile.pendingMovementY = 0
-                    pile.pendingMovementDistance = 0
-                }
-
                 pile.resize(to: binCount)
-                pile.lastFrame = surface.frame
-                pile.lastSurface = surface
+                pile.surface = surface
             } else {
-                piles[surface.id] = SnowPile(surface: surface, binCount: binCount, now: now)
+                piles[surface.id] = SnowPile(surface: surface, binCount: binCount)
             }
         }
-
-        var temporarilyMissingSurfaces: [SnowSurface] = []
-        for id in Array(piles.keys) where !activeIDs.contains(id) {
-            guard let pile = piles[id] else { continue }
-            if now - pile.lastSeenAt < missingSurfaceGracePeriod {
-                // Keep rendering/colliding against its last known position while
-                // CGWindowList temporarily omits a moving or animating window.
-                temporarilyMissingSurfaces.append(pile.lastSurface)
-                continue
-            }
-
+        for id in Array(piles.keys) where !active.contains(id) {
             piles.removeValue(forKey: id)
-            shedPile(pile, from: pile.lastSurface, movementX: 0, movementY: 0, ratio: 1)
         }
-        surfaces.append(contentsOf: temporarilyMissingSurfaces)
     }
 
-    private func isOccluded(_ point: CGPoint, before surfaceIndex: Int) -> Bool {
-        guard surfaceIndex > 0 else { return false }
-        for index in 0..<min(surfaceIndex, surfaces.count) {
-            let upper = surfaces[index]
-            if !upper.isBottomEdge && upper.frame.contains(point) {
-                return true
-            }
+    private func applyWindowMovement(_ movement: MovedSurface, to pile: SnowPile) {
+        let speed = hypot(movement.velocity.dx, movement.velocity.dy)
+
+        // Inertia: snow tends to stay where it was, so relative to the window it slides backwards.
+        let slide = min(60, max(-60, -movement.delta.dx * 0.42))
+        if abs(slide) > 0.4 {
+            slidePile(pile, bins: slide / binWidth, surface: movement.previous, velocity: movement.velocity)
         }
-        return false
+
+        // A drag shakes some off; a throw sends most of it flying.
+        let distanceShare = movement.distance / 1800
+        let speedShare = max(0, speed - 300) / 5000
+        let ratio = min(0.9, max(0.0015, distanceShare + speedShare))
+        shedPile(pile, from: movement.previous, velocity: movement.velocity, ratio: ratio)
     }
 
-    private func isOccluded(_ rect: CGRect, before surfaceIndex: Int) -> Bool {
-        guard surfaceIndex > 0, !rect.isNull, !rect.isEmpty else { return false }
-        for index in 0..<min(surfaceIndex, surfaces.count) {
-            let upper = surfaces[index]
-            if !upper.isBottomEdge && upper.frame.intersects(rect) {
-                return true
-            }
-        }
-        return false
+    private func slidePile(_ pile: SnowPile, bins: CGFloat, surface: Surface, velocity: CGVector) {
+        guard pile.count > 2 else { return }
+        let before = pile.totalHeight()
+        pile.fresh = Self.shifted(pile.fresh, by: bins)
+        pile.packed = Self.shifted(pile.packed, by: bins * 0.35) // Compacted snow clings to the window.
+        let lost = before - pile.totalHeight()
+        guard lost > 0.6 else { return }
+
+        // What slid past the edge falls off as powder.
+        let edgeX = bins > 0 ? surface.right : surface.left
+        let direction: CGFloat = bins > 0 ? 1 : -1
+        let count = min(6, max(1, Int(lost / 3)))
+        spawnPowder(
+            at: CGPoint(x: edgeX, y: surface.supportY + 2),
+            velocity: CGVector(dx: direction * 36 + velocity.dx * 0.10, dy: -28),
+            count: count,
+            sourceSurfaceID: surface.id
+        )
     }
 
-    private func pileIndex(for x: CGFloat, on surface: SnowSurface) -> Int {
+    private static func shifted(_ source: [CGFloat], by bins: CGFloat) -> [CGFloat] {
+        let count = source.count
+        var result = [CGFloat](repeating: 0, count: count)
+        for index in 0..<count {
+            let origin = CGFloat(index) - bins
+            let lower = Int(floor(origin))
+            let fraction = origin - CGFloat(lower)
+            let a: CGFloat = (lower >= 0 && lower < count) ? source[lower] : 0
+            let b: CGFloat = (lower + 1 >= 0 && lower + 1 < count) ? source[lower + 1] : 0
+            result[index] = a * (1 - fraction) + b * fraction
+        }
+        return result
+    }
+
+    private func shedPile(_ pile: SnowPile, from surface: Surface, velocity: CGVector, ratio: CGFloat) {
+        guard ratio > 0 else { return }
+        for index in 0..<pile.count {
+            let height = pile.height(at: index)
+            guard height > 0.12 else { continue }
+            let removedFresh = pile.fresh[index] * ratio
+            let packedRatio: CGFloat = ratio >= 0.999 ? 1 : ratio * 0.46
+            let removedPacked = pile.packed[index] * packedRatio
+            let removed = removedFresh + removedPacked
+            pile.fresh[index] -= removedFresh
+            pile.packed[index] -= removedPacked
+            guard removed > 0.08 else { continue }
+
+            let x = surface.left + (CGFloat(index) + 0.5) * binWidth
+            let y = surface.supportY + height * 0.55
+            // Snow keeps its place while the window moves, so it is thrown against the window's motion.
+            let dx = min(220, max(-220, -velocity.dx * 0.30))
+            let dy = min(80, max(-160, -30 - velocity.dy * 0.15))
+            let count = min(6, max(1, Int(removed / 2.2)))
+            spawnPowder(at: CGPoint(x: x, y: y), velocity: CGVector(dx: dx, dy: dy), count: count, sourceSurfaceID: surface.id)
+        }
+    }
+
+    private func pileIndex(for x: CGFloat, on surface: Surface) -> Int {
         let raw = Int((x - surface.left) / binWidth)
         let count = piles[surface.id]?.count ?? 1
         return max(0, min(count - 1, raw))
     }
 
-    private func depositSnow(on surface: SnowSurface, x: CGFloat, amount: CGFloat) {
+    private func depositSnow(on surface: Surface, x: CGFloat, amount: CGFloat) {
         guard let pile = piles[surface.id], pile.count > 0 else { return }
         let center = pileIndex(for: x, on: surface)
         // A Gaussian footprint makes each landing form a small rounded pillow.
@@ -578,11 +503,10 @@ final class SnowOverlayView: NSView {
         }
     }
 
-
     private func spillPileEdges(_ pile: SnowPile, deltaTime dt: CGFloat) {
         guard pile.count > 1, dt > 0 else { return }
 
-        let surface = pile.lastSurface
+        let surface = pile.surface
         for index in [0, pile.count - 1] {
             let edgeHeight = pile.height(at: index)
             let overflow = max(0, edgeHeight - 1.45)
@@ -609,34 +533,6 @@ final class SnowOverlayView: NSView {
         }
     }
 
-    private func shedPile(
-        _ pile: SnowPile,
-        from surface: SnowSurface,
-        movementX: CGFloat,
-        movementY: CGFloat,
-        ratio: CGFloat
-    ) {
-        guard ratio > 0 else { return }
-        for index in 0..<pile.count {
-            let height = pile.height(at: index)
-            guard height > 0.12 else { continue }
-            let removedFresh = pile.fresh[index] * ratio
-            let packedRatio: CGFloat = ratio >= 0.999 ? 1 : ratio * 0.46
-            let removedPacked = pile.packed[index] * packedRatio
-            let removed = removedFresh + removedPacked
-            pile.fresh[index] -= removedFresh
-            pile.packed[index] -= removedPacked
-            guard removed > 0.08 else { continue }
-
-            let x = surface.left + (CGFloat(index) + 0.5) * binWidth
-            let y = surface.supportY + height * 0.55
-            let dx = max(-180, min(180, -movementX * 2.5))
-            let dy: CGFloat = -32
-            let count = min(6, max(1, Int(removed / 2.2)))
-            spawnPowder(at: CGPoint(x: x, y: y), velocity: CGVector(dx: dx, dy: dy), count: count, sourceSurfaceID: surface.id)
-        }
-    }
-
     // MARK: Mouse interaction: swept path, brush, soft powder and air wake
 
     private func currentMouseLocal() -> CGPoint {
@@ -644,19 +540,7 @@ final class SnowOverlayView: NSView {
         return CGPoint(x: global.x - screen.frame.minX, y: global.y - screen.frame.minY)
     }
 
-    private func distance(from point: CGPoint, toSegmentStart start: CGPoint, end: CGPoint) -> CGFloat {
-        let dx = end.x - start.x
-        let dy = end.y - start.y
-        let lengthSquared = dx * dx + dy * dy
-        guard lengthSquared > 0.001 else { return hypot(point.x - start.x, point.y - start.y) }
-        let t = max(0, min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared))
-        let projection = CGPoint(x: start.x + t * dx, y: start.y + t * dy)
-        return hypot(point.x - projection.x, point.y - projection.y)
-    }
-
-    private func applyMouseInteraction(deltaTime dt: CGFloat) {
-        let current = currentMouseLocal()
-        defer { previousMouse = current }
+    private func applyMouseInteraction(mouse current: CGPoint, deltaTime dt: CGFloat) {
         guard let previous = previousMouse else { return }
 
         let dx = current.x - previous.x
@@ -671,11 +555,12 @@ final class SnowOverlayView: NSView {
         let swipeVelocity = CGVector(dx: dx / max(dt, 0.001) * 0.16, dy: dy / max(dt, 0.001) * 0.13)
         var removedVolume: CGFloat = 0
 
+        let surfaces = tracker.surfaces
         for (surfaceIndex, surface) in surfaces.enumerated() where surface.isTarget {
             guard let pile = piles[surface.id], pile.count > 0 else { continue }
             let minMouseY = min(previous.y, current.y)
             let maxMouseY = max(previous.y, current.y)
-            let maxPile = (0..<pile.count).map { pile.height(at: $0) }.max() ?? 0
+            let maxPile = pile.maxHeight()
             guard maxMouseY >= surface.supportY - brushRadius,
                   minMouseY <= surface.supportY + maxPile + brushRadius else { continue }
 
@@ -685,9 +570,9 @@ final class SnowOverlayView: NSView {
             var particleY: CGFloat = 0
             var particleVelocityX: CGFloat = 0
             var particleVelocityY: CGFloat = 0
-            let sampleCount = max(1, stepCount)
-            for sample in 0...sampleCount {
-                let t = CGFloat(sample) / CGFloat(sampleCount)
+
+            for sample in 0...stepCount {
+                let t = CGFloat(sample) / CGFloat(stepCount)
                 let cursor = CGPoint(x: previous.x + dx * t, y: previous.y + dy * t)
                 guard cursor.x >= surface.left - brushRadius,
                       cursor.x <= surface.right + brushRadius else { continue }
@@ -698,8 +583,8 @@ final class SnowOverlayView: NSView {
 
                 for index in first...last {
                     let x = surface.left + (CGFloat(index) + 0.5) * binWidth
-                    if !surface.isBottomEdge,
-                       isOccluded(CGPoint(x: x, y: surface.supportY + 1.5), before: surfaceIndex) { continue }
+                    if !surface.isGround,
+                       tracker.isOccluded(point: CGPoint(x: x, y: surface.supportY + 1.5), beforeIndex: surfaceIndex) { continue }
                     let total = pile.height(at: index)
                     guard total > 0.35 else { continue }
                     let crest = CGPoint(x: x, y: surface.supportY + total * 0.62)
@@ -743,9 +628,6 @@ final class SnowOverlayView: NSView {
                 spawnPowder(at: center, velocity: velocity, count: particleCount, sourceSurfaceID: surface.id)
             }
             if changed { relaxPile(pile, deltaTime: dt) }
-
-            // The surface array is top-to-bottom: a top window protects piles behind it.
-            _ = surfaceIndex
         }
 
         // A moving hand creates a small curl in nearby ambient flakes.
@@ -765,76 +647,78 @@ final class SnowOverlayView: NSView {
             ambientFlakes[index].velocity.dy += (dy * 0.08 + swirlY) * falloff
         }
 
-        if removedVolume > 14, ProcessInfo.processInfo.systemUptime - lastHapticTime > 0.12 {
+        let now = ProcessInfo.processInfo.systemUptime
+        if removedVolume > 14, now - lastHapticTime > 0.12 {
             NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
-            lastHapticTime = ProcessInfo.processInfo.systemUptime
+            lastHapticTime = now
         }
     }
 
-    // MARK: Simulation loop and collisions
+    // MARK: Frame loop
 
     private func tick() {
+        guard isRunning else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let dt = CGFloat(min(0.05, max(0.001, now - lastTick)))
         lastTick = now
         elapsed += dt
 
-        if now - lastPowerCheck > 20 {
+        if now - lastPowerCheck > 15 {
             lastPowerCheck = now
-            let latestPowerState = isOnBatteryPower()
-            if latestPowerState != onBatteryPower {
-                onBatteryPower = latestPowerState
-                resizeAmbientFlakes()
-                scheduleTimer()
-            }
+            refreshPowerState(force: false)
         }
-
-        if renderLayer == .foreground, now - lastSurfaceScan > 0.16 {
-            refreshSurfaces()
-            lastSurfaceScan = now
-        }
-
-        // Full-screen windows pause the foreground simulation to avoid covering movies/games.
-        if renderLayer == .foreground, isDisplayCovered {
-            if !didClearForFullScreen {
-                didClearForFullScreen = true
-                metalParticleView?.update(particles: [])
-                metalParticleView?.draw()
-                needsDisplay = true
-            }
-            return
-        }
-        didClearForFullScreen = false
 
         if renderLayer == .foreground {
-            applyMouseInteraction(deltaTime: dt)
+            // Poll the window list slowly, but quickly while a window is being dragged.
+            let recentlyMoved = now - tracker.lastMovementTime < 0.7
+            let interval: TimeInterval = recentlyMoved ? 1.0 / 30.0 : 0.12
+            if now - lastSurfaceScan >= interval {
+                lastSurfaceScan = now
+                scanSurfaces(now: now)
+            }
+            if tracker.isDisplayCovered {
+                enterCoveredState()
+                return
+            }
         }
+
+        let mouse = currentMouseLocal()
+        if renderLayer == .foreground {
+            applyMouseInteraction(mouse: mouse, deltaTime: dt)
+        }
+        previousMouse = mouse
 
         updateAmbientFlakes(deltaTime: dt)
         updateBurstFlakes(deltaTime: dt)
-        let freshMeltFactor = exp(-dt * 0.0008)
-        let packedMeltFactor = exp(-dt * 0.00018)
-        for pile in piles.values {
-            relaxPile(pile, deltaTime: dt)
-            spillPileEdges(pile, deltaTime: dt)
-            for index in 0..<pile.count {
-                pile.fresh[index] *= freshMeltFactor
-                pile.packed[index] *= packedMeltFactor
-            }
+        updatePiles(deltaTime: dt)
+
+        buildOutput(mouse: mouse)
+        metalView?.submit(output)
+    }
+
+    /// A full-screen window covers the display: draw nothing and stop the frame loop until it goes away.
+    private func enterCoveredState() {
+        output.reset()
+        metalView?.submit(output)
+        metalView?.isPaused = true
+        guard coveredTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.checkCoveredState()
         }
-        if clearFadeRemaining > 0 {
-            let fadeTime = min(dt, clearFadeRemaining)
-            let fade = exp(-fadeTime * 2.6)
-            for pile in piles.values {
-                for index in 0..<pile.count {
-                    pile.fresh[index] *= fade
-                    pile.packed[index] *= fade
-                }
-            }
-            clearFadeRemaining = max(0, clearFadeRemaining - fadeTime)
-        }
-        updateMetalParticles()
-        needsDisplay = true
+        RunLoop.main.add(timer, forMode: .common)
+        coveredTimer = timer
+    }
+
+    private func checkCoveredState() {
+        guard isRunning else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        scanSurfaces(now: now)
+        guard !tracker.isDisplayCovered else { return }
+        coveredTimer?.invalidate()
+        coveredTimer = nil
+        lastTick = now
+        lastSurfaceScan = now
+        metalView?.isPaused = false
     }
 
     private func updateAmbientFlakes(deltaTime dt: CGFloat) {
@@ -871,18 +755,18 @@ final class SnowOverlayView: NSView {
         }
     }
 
-    private func landingSurface(from old: CGPoint, to new: CGPoint, excludingSurfaceID: Int? = nil) -> SnowSurface? {
+    private func landingSurface(from old: CGPoint, to new: CGPoint, excludingSurfaceID: Int? = nil) -> Surface? {
         guard new.y < old.y else { return nil }
+        let surfaces = tracker.surfaces
         for (index, surface) in surfaces.enumerated() where surface.isTarget {
             if surface.id == excludingSurfaceID { continue }
             guard new.x >= surface.left, new.x <= surface.right else { continue }
-            let pile = piles[surface.id]
             let bin = pileIndex(for: new.x, on: surface)
-            let pileHeight = pile?.height(at: bin) ?? 0
+            let pileHeight = piles[surface.id]?.height(at: bin) ?? 0
             let top = surface.supportY + pileHeight
             guard old.y >= top, new.y <= top else { continue }
-            let occlusionPoint = CGPoint(x: new.x, y: surface.supportY + 1.5)
-            if surface.isBottomEdge || !isOccluded(occlusionPoint, before: index) {
+            let probe = CGPoint(x: new.x, y: surface.supportY + 1.5)
+            if surface.isGround || !tracker.isOccluded(point: probe, beforeIndex: index) {
                 return surface
             }
         }
@@ -932,407 +816,244 @@ final class SnowOverlayView: NSView {
         }
     }
 
-    private func updateMetalParticles() {
-        guard let metalParticleView else { return }
-        let mouse = currentMouseLocal()
-        var renderList = ambientFlakes
+    private func updatePiles(deltaTime dt: CGFloat) {
+        guard renderLayer == .foreground else { return }
+        let freshMeltFactor = exp(-dt * 0.0008)
+        let packedMeltFactor = exp(-dt * 0.00018)
+        for pile in piles.values {
+            relaxPile(pile, deltaTime: dt)
+            spillPileEdges(pile, deltaTime: dt)
+            for index in 0..<pile.count {
+                pile.fresh[index] *= freshMeltFactor
+                pile.packed[index] *= packedMeltFactor
+            }
+        }
+        if clearFadeRemaining > 0 {
+            let fadeTime = min(dt, clearFadeRemaining)
+            let fade = exp(-fadeTime * 2.6)
+            for pile in piles.values {
+                for index in 0..<pile.count {
+                    pile.fresh[index] *= fade
+                    pile.packed[index] *= fade
+                }
+            }
+            clearFadeRemaining = max(0, clearFadeRemaining - fadeTime)
+        }
+    }
+
+    // MARK: Building the frame (everything is drawn by the GPU)
+
+    private func buildOutput(mouse: CGPoint) {
+        output.reset()
         if renderLayer == .foreground {
-            renderList.append(contentsOf: burstFlakes)
+            appendDrifts()
         }
-
-        let packets: [SnowGPUInstance] = renderList.compactMap { flake in
-            let focusFade: CGFloat
-            if flake.life < 0, flake.depth > 0.82 {
-                let distance = hypot(flake.position.x - mouse.x, flake.position.y - mouse.y)
-                let normalized = min(1, distance / 92)
-                focusFade = 0.15 + 0.85 * normalized * normalized
-            } else {
-                focusFade = 1
-            }
-            let lifeFade = flake.life > 0 ? min(1, flake.life * 0.8) : 1
-            let alpha = flake.alpha * focusFade * lifeFade
-            guard alpha > 0.015 else { return nil }
-
-            let backingScale = window?.backingScaleFactor ?? screen.backingScaleFactor
-            return SnowGPUInstance(
-                center: SIMD2<Float>(Float(flake.position.x * backingScale), Float(flake.position.y * backingScale)),
-                radius: Float(flake.radius * backingScale),
-                alpha: Float(alpha),
-                rotation: Float(flake.rotation),
-                softness: Float(flake.depth)
-            )
-        }
-        metalParticleView.update(particles: packets)
-        metalParticleView.draw()
-    }
-
-    private func isOnBatteryPower() -> Bool {
-        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
-            return false
-        }
-        for source in sources {
-            guard let description = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any] else {
-                continue
-            }
-            if let state = description[kIOPSPowerSourceStateKey] as? String,
-               state == kIOPSBatteryPowerValue {
-                return true
-            }
-        }
-        return false
-    }
-
-    // MARK: Drawing
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
-        context.clear(dirtyRect)
-        if renderLayer == .foreground, isDisplayCovered { return }
-
+        appendFlakes(ambientFlakes, mouse: mouse, fadesNearCursor: true)
         if renderLayer == .foreground {
-            drawSnowdrifts(in: context)
-        }
-        if metalParticleView == nil {
-            drawFlakes(ambientFlakes, in: context, fadesNearCursor: true)
-            if renderLayer == .foreground {
-                drawFlakes(burstFlakes, in: context, fadesNearCursor: false)
-            }
+            appendFlakes(burstFlakes, mouse: mouse, fadesNearCursor: false)
         }
     }
 
-    private func drawFlakes(_ flakes: [Snowflake], in context: CGContext, fadesNearCursor: Bool) {
-        guard !flakeSprites.isEmpty else { return }
-        let mouse = currentMouseLocal()
-        context.saveGState()
-
+    private func appendFlakes(_ flakes: [SnowFlake], mouse: CGPoint, fadesNearCursor: Bool) {
         for flake in flakes {
-            let focusFade: CGFloat
+            // Near flakes thin out around the cursor so they never get in the way of reading or clicking.
+            var focusFade: CGFloat = 1
             if fadesNearCursor, flake.depth > 0.82 {
                 let distance = hypot(flake.position.x - mouse.x, flake.position.y - mouse.y)
                 let normalized = min(1, distance / 92)
                 focusFade = 0.15 + 0.85 * normalized * normalized
-            } else {
-                focusFade = 1
             }
-
-            let lifeFade = flake.life > 0 ? min(1, flake.life * 0.8) : 1
+            let lifeFade: CGFloat = flake.life > 0 ? min(1, flake.life * 0.8) : 1
             let alpha = flake.alpha * focusFade * lifeFade
             guard alpha > 0.015 else { continue }
 
-            let image = flakeSprites[min(flake.spriteIndex, flakeSprites.count - 1)]
-            let widthScale = 0.58 + 0.42 * abs(cos(flake.rotation * 1.7))
-            let width = flake.radius * 2 * widthScale
-            let height = flake.radius * 2
-
-            context.saveGState()
-            context.setAlpha(alpha)
-            context.translateBy(x: flake.position.x, y: flake.position.y)
-            context.rotate(by: flake.rotation)
-            let rect = CGRect(x: -width * 0.5, y: -height * 0.5, width: width, height: height)
-            context.draw(image, in: rect)
-            context.restoreGState()
+            // Tumbling flattens the flake slightly, as if it turned in 3-D.
+            let squash = 0.80 + 0.20 * abs(cos(flake.rotation * 1.7))
+            output.particles.append(SnowGPUInstance(
+                cx: Float(flake.position.x),
+                cy: Float(flake.position.y),
+                hw: Float(flake.radius * squash),
+                hh: Float(flake.radius),
+                rotation: Float(flake.rotation),
+                alpha: Float(alpha),
+                softness: Float(flake.depth)
+            ))
         }
-
-        context.restoreGState()
     }
 
-    private func drawSnowdrifts(in context: CGContext) {
-        // CGWindowList order is front-to-back. Mask each rear pile wherever an upper
-        // window currently covers it, without deleting the stored snow underneath.
+    private func isHidden(_ lo: CGFloat, _ hi: CGFloat, by intervals: [SurfaceInterval]) -> Bool {
+        for interval in intervals where interval.lo < hi && interval.hi > lo {
+            return true
+        }
+        return false
+    }
+
+    private func appendDrifts() {
+        let surfaces = tracker.surfaces
+        // Rear windows first, so the piles of front windows are drawn over them.
         for surfaceIndex in surfaces.indices.reversed() {
             let surface = surfaces[surfaceIndex]
             guard surface.isTarget, let pile = piles[surface.id], pile.count > 0 else { continue }
+            let maxHeight = pile.maxHeight()
+            guard maxHeight > 0.3 else { continue }
 
-            let visibleHeights: [CGFloat] = (0..<pile.count).map { index in
-                let x = surface.left + (CGFloat(index) + 0.5) * binWidth
-                let height = pile.height(at: index)
-                let pileColumn = CGRect(
-                    x: x - binWidth * 0.5,
-                    y: surface.supportY - 3,
-                    width: binWidth,
-                    height: height + 3
+            // Mask the part of the pile covered by windows in front, without deleting the snow underneath.
+            var hidden: [SurfaceInterval] = []
+            if !surface.isGround {
+                hidden = tracker.hiddenIntervals(
+                    beforeIndex: surfaceIndex,
+                    minY: surface.supportY - 3,
+                    maxY: surface.supportY + maxHeight + 2
                 )
-                return !surface.isBottomEdge && isOccluded(pileColumn, before: surfaceIndex) ? 0 : height
             }
 
-            var runStart: Int?
-            for index in 0...visibleHeights.count {
-                let height = index < visibleHeights.count ? visibleHeights[index] : 0
-                if height > 0.30, runStart == nil {
-                    runStart = index
-                } else if height <= 0.30, let start = runStart {
-                    let end = index - 1
-                    drawDriftSegment(visibleHeights, surface: surface, range: start...end, in: context)
+            var heights = [CGFloat](repeating: 0, count: pile.count)
+            for index in 0..<pile.count {
+                let columnLeft = surface.left + CGFloat(index) * binWidth
+                if isHidden(columnLeft, columnLeft + binWidth, by: hidden) { continue }
+                heights[index] = pile.height(at: index)
+            }
+
+            var runStart: Int? = nil
+            for index in 0...heights.count {
+                let height: CGFloat = index < heights.count ? heights[index] : 0
+                if height > 0.30 {
+                    if runStart == nil { runStart = index }
+                } else if let start = runStart {
+                    appendRun(heights: heights, range: start...(index - 1), surface: surface)
                     runStart = nil
                 }
             }
+            appendGlints(heights: heights, surface: surface)
         }
     }
 
-    private func drawDriftSegment(
-        _ heights: [CGFloat],
-        surface: SnowSurface,
-        range: ClosedRange<Int>,
-        in context: CGContext
-    ) {
-        guard !range.isEmpty else { return }
-        let startX = surface.left
-        let supportY = surface.supportY
-        let baseY = supportY - (surface.isBottomEdge ? 0 : 2.5)
-        let firstX = startX + CGFloat(range.lowerBound) * binWidth
-        let lastX = min(surface.right, startX + CGFloat(range.upperBound + 1) * binWidth)
+    private func appendRun(heights: [CGFloat], range: ClosedRange<Int>, surface: Surface) {
+        let baseY = surface.supportY - (surface.isGround ? 0 : 2.5)
+        let firstX = surface.left + CGFloat(range.lowerBound) * binWidth
+        let lastX = min(surface.right, surface.left + CGFloat(range.upperBound + 1) * binWidth)
         guard lastX > firstX else { return }
 
-        var crestPoints: [CGPoint] = []
-        crestPoints.reserveCapacity(range.count + 1)
+        var crest: [CGPoint] = []
+        crest.append(CGPoint(x: firstX, y: baseY))
+        crest.append(CGPoint(x: firstX + binWidth * 0.18, y: surface.supportY + heights[range.lowerBound] * 0.5))
         for index in range {
-            let centerX = startX + (CGFloat(index) + 0.5) * binWidth
-            let height = heights[index]
-            let smallRidge = sin(CGFloat(index) * 1.73 + CGFloat(surface.id) * 0.11) * 0.42
-            crestPoints.append(CGPoint(x: centerX, y: supportY + height + smallRidge))
+            let centerX = min(lastX, surface.left + (CGFloat(index) + 0.5) * binWidth)
+            let ridge = sin(CGFloat(index) * 1.73 + CGFloat(surface.id) * 0.11) * 0.42
+            crest.append(CGPoint(x: centerX, y: surface.supportY + heights[index] + ridge))
         }
-        guard let first = crestPoints.first else { return }
+        crest.append(CGPoint(x: lastX - binWidth * 0.18, y: surface.supportY + heights[range.upperBound] * 0.5))
+        crest.append(CGPoint(x: lastX, y: baseY))
 
-        let path = CGMutablePath()
-        // Rounded ends, and a slight soft lip that sits over the window's top border.
-        path.move(to: CGPoint(x: firstX, y: baseY))
-        path.addQuadCurve(
-            to: CGPoint(x: first.x, y: first.y),
-            control: CGPoint(x: firstX + min(8, binWidth * 1.7), y: baseY + 1)
-        )
-        if crestPoints.count > 1 {
-            for pointIndex in 0..<(crestPoints.count - 1) {
-                let current = crestPoints[pointIndex]
-                let next = crestPoints[pointIndex + 1]
-                let midpoint = CGPoint(x: (current.x + next.x) * 0.5, y: (current.y + next.y) * 0.5)
-                path.addQuadCurve(to: midpoint, control: current)
+        appendDriftMesh(crest: chaikin(crest), baseY: baseY, surface: surface)
+    }
+
+    /// One round of corner cutting turns the 4-point bins into a smooth silhouette.
+    private func chaikin(_ points: [CGPoint]) -> [CGPoint] {
+        guard points.count > 2 else { return points }
+        var result: [CGPoint] = [points[0]]
+        for index in 0..<(points.count - 1) {
+            let p = points[index]
+            let q = points[index + 1]
+            result.append(CGPoint(x: p.x * 0.75 + q.x * 0.25, y: p.y * 0.75 + q.y * 0.25))
+            result.append(CGPoint(x: p.x * 0.25 + q.x * 0.75, y: p.y * 0.25 + q.y * 0.75))
+        }
+        result.append(points[points.count - 1])
+        return result
+    }
+
+    private func appendDriftMesh(crest: [CGPoint], baseY: CGFloat, surface: Surface) {
+        guard crest.count > 1 else { return }
+        let dark = isDarkAppearance
+
+        let top = dark
+            ? DriftColor(r: 0.90, g: 0.94, b: 1.00, a: 0.94)
+            : DriftColor(r: 1.00, g: 1.00, b: 1.00, a: 0.98)
+        let bottom = dark
+            ? DriftColor(r: 0.48, g: 0.60, b: 0.78, a: 0.90)
+            : DriftColor(r: 0.76, g: 0.84, b: 0.94, a: 0.92)
+        let topClear = DriftColor(r: top.r, g: top.g, b: top.b, a: 0)
+        let rim = DriftColor(r: 1, g: 1, b: 1, a: dark ? 0.50 : 0.72)
+        let rimClear = DriftColor(r: 1, g: 1, b: 1, a: 0)
+        let shadowStrength: Float = dark ? 0.34 : 0.24
+
+        for index in 0..<(crest.count - 1) {
+            let p = crest[index]
+            let q = crest[index + 1]
+            let pBase = CGPoint(x: p.x, y: baseY)
+            let qBase = CGPoint(x: q.x, y: baseY)
+
+            // Body: bright crest fading to a cool blue where it meets the window.
+            appendQuad(p, q, pBase, qBase, topLeft: top, topRight: top, bottomLeft: bottom, bottomRight: bottom)
+
+            // Soft anti-aliased fringe above the crest.
+            let pUp = CGPoint(x: p.x, y: p.y + 1.4)
+            let qUp = CGPoint(x: q.x, y: q.y + 1.4)
+            appendQuad(pUp, qUp, p, q, topLeft: topClear, topRight: topClear, bottomLeft: top, bottomRight: top)
+
+            // Light catching the top of the drift.
+            let pLow = CGPoint(x: p.x, y: p.y - 1.7)
+            let qLow = CGPoint(x: q.x, y: q.y - 1.7)
+            appendQuad(p, q, pLow, qLow, topLeft: rim, topRight: rim, bottomLeft: rimClear, bottomRight: rimClear)
+
+            // Contact shadow on the window frame below the drift.
+            if !surface.isGround {
+                let pStrength = shadowStrength * Float(min(1, max(0, (p.y - baseY) / 3)))
+                let qStrength = shadowStrength * Float(min(1, max(0, (q.y - baseY) / 3)))
+                let pShadow = DriftColor(r: 0.10, g: 0.18, b: 0.29, a: pStrength)
+                let qShadow = DriftColor(r: 0.10, g: 0.18, b: 0.29, a: qStrength)
+                let clear = DriftColor(r: 0.10, g: 0.18, b: 0.29, a: 0)
+                let pDeep = CGPoint(x: p.x, y: baseY - 3.6)
+                let qDeep = CGPoint(x: q.x, y: baseY - 3.6)
+                appendQuad(pBase, qBase, pDeep, qDeep, topLeft: pShadow, topRight: qShadow, bottomLeft: clear, bottomRight: clear)
             }
         }
-        path.addQuadCurve(
-            to: CGPoint(x: lastX, y: baseY),
-            control: CGPoint(x: lastX - min(8, binWidth * 1.7), y: baseY + 1)
-        )
-        path.closeSubpath()
+    }
 
-        context.saveGState()
-        let shadowColor = NSColor(calibratedRed: 0.10, green: 0.18, blue: 0.29, alpha: isDarkAppearance ? 0.38 : 0.25).cgColor
-        context.setShadow(offset: CGSize(width: 0, height: -2.2), blur: 4.2, color: shadowColor)
-        context.addPath(path)
-        context.setFillColor(NSColor.white.withAlphaComponent(isDarkAppearance ? 0.91 : 0.97).cgColor)
-        context.fillPath()
-        context.restoreGState()
+    private func appendQuad(
+        _ topLeftPoint: CGPoint,
+        _ topRightPoint: CGPoint,
+        _ bottomLeftPoint: CGPoint,
+        _ bottomRightPoint: CGPoint,
+        topLeft: DriftColor,
+        topRight: DriftColor,
+        bottomLeft: DriftColor,
+        bottomRight: DriftColor
+    ) {
+        let a = driftVertex(topLeftPoint, topLeft)
+        let b = driftVertex(topRightPoint, topRight)
+        let c = driftVertex(bottomLeftPoint, bottomLeft)
+        let d = driftVertex(bottomRightPoint, bottomRight)
+        output.drift.append(a)
+        output.drift.append(b)
+        output.drift.append(c)
+        output.drift.append(b)
+        output.drift.append(d)
+        output.drift.append(c)
+    }
 
-        if let gradient = (isDarkAppearance ? darkDriftGradient : lightDriftGradient) {
-            context.saveGState()
-            context.addPath(path)
-            context.clip()
-            let highest = crestPoints.map(\.y).max() ?? supportY + 2
-            context.drawLinearGradient(
-                gradient,
-                start: CGPoint(x: 0, y: highest),
-                end: CGPoint(x: 0, y: baseY),
-                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
-            )
-            context.restoreGState()
-        }
+    private func driftVertex(_ point: CGPoint, _ color: DriftColor) -> DriftVertex {
+        DriftVertex(x: Float(point.x), y: Float(point.y), r: color.r, g: color.g, b: color.b, a: color.a)
+    }
 
-        // Soft, broken highlight rather than a hard continuous outline.
-        context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(isDarkAppearance ? 0.54 : 0.72).cgColor)
-        context.setLineWidth(0.75)
-        let highlight = CGMutablePath()
-        highlight.move(to: first)
-        for point in crestPoints.dropFirst() {
-            highlight.addLine(to: point)
-        }
-        context.addPath(highlight)
-        context.strokePath()
-        context.restoreGState()
-
-        // Rare tiny crystals glint briefly inside the drift.
-        for index in range where index % 9 == Int(elapsed * 1.7) % 9 {
+    /// Rare tiny crystals glint briefly inside the drift.
+    private func appendGlints(heights: [CGFloat], surface: Surface) {
+        let phase = Int(elapsed * 1.7) % 9
+        for index in stride(from: phase, to: heights.count, by: 9) {
+            guard heights[index] > 1.2 else { continue }
             let sparkle = sin(elapsed * 2.6 + CGFloat(index) * 1.7 + CGFloat(surface.id))
             guard sparkle > 0.78 else { continue }
-            let x = startX + (CGFloat(index) + 0.5) * binWidth
-            let y = supportY + heights[index] * 0.64
-            context.setFillColor(NSColor.white.withAlphaComponent(0.26 + sparkle * 0.5).cgColor)
-            context.fillEllipse(in: CGRect(x: x, y: y, width: 1.1, height: 1.1))
-        }
-    }
-}
-
-
-// MARK: - Instanced Metal particle renderer
-
-private struct SnowGPUInstance {
-    var center: SIMD2<Float>
-    var radius: Float
-    var alpha: Float
-    var rotation: Float
-    var softness: Float
-}
-
-private struct SnowGPUUniforms {
-    var viewportSize: SIMD2<Float>
-}
-
-/// Uses one instanced draw call for all particles. Snowdrifts remain vector-drawn by AppKit,
-/// which keeps their geometry easy to tune while moving the high-count particle layer to GPU.
-private final class SnowParticleMetalView: MTKView, MTKViewDelegate {
-    private let commandQueue: MTLCommandQueue?
-    private let pipeline: MTLRenderPipelineState?
-    private var particleBuffer: MTLBuffer?
-    private var bufferCapacity = 0
-    private var instanceCount = 0
-    private static let spriteShader = """
-    #include <metal_stdlib>
-    using namespace metal;
-
-    struct SnowParticle {
-        float2 center;
-        float radius;
-        float alpha;
-        float rotation;
-        float softness;
-    };
-
-    struct SnowUniforms { float2 viewportSize; };
-
-    struct SnowVertexOut {
-        float4 position [[position]];
-        float2 uv;
-        float alpha;
-        float softness;
-    };
-
-    vertex SnowVertexOut snowVertex(
-        uint vertexID [[vertex_id]],
-        uint instanceID [[instance_id]],
-        const device SnowParticle* particles [[buffer(0)]],
-        constant SnowUniforms& uniforms [[buffer(1)]]
-    ) {
-        const float2 corners[6] = {
-            float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0),
-            float2(-1.0, 1.0), float2(1.0, -1.0), float2(1.0, 1.0)
-        };
-        SnowParticle particle = particles[instanceID];
-        float2 corner = corners[vertexID];
-        float cosine = cos(particle.rotation);
-        float sine = sin(particle.rotation);
-        float2 rotated = float2(
-            corner.x * cosine - corner.y * sine,
-            corner.x * sine + corner.y * cosine
-        );
-        float2 pixel = particle.center + rotated * particle.radius;
-        float2 clip = float2(
-            pixel.x / uniforms.viewportSize.x * 2.0 - 1.0,
-            pixel.y / uniforms.viewportSize.y * 2.0 - 1.0
-        );
-        SnowVertexOut output;
-        output.position = float4(clip, 0.0, 1.0);
-        output.uv = rotated;
-        output.alpha = particle.alpha;
-        output.softness = particle.softness;
-        return output;
-    }
-
-    fragment half4 snowFragment(SnowVertexOut input [[stage_in]]) {
-        float distanceFromCenter = length(input.uv);
-        float2 lobeA = input.uv - float2(-0.20, 0.10);
-        float2 lobeB = input.uv - float2(0.18, -0.17);
-        float core = exp(-distanceFromCenter * distanceFromCenter * mix(3.0, 4.6, input.softness));
-        float lobe = max(exp(-dot(lobeA, lobeA) * 15.0) * 0.24,
-                         exp(-dot(lobeB, lobeB) * 18.0) * 0.18);
-        float innerEdge = mix(0.40, 0.64, input.softness);
-        float feather = 1.0 - smoothstep(innerEdge, 1.0, distanceFromCenter);
-        float alpha = min(1.0, feather * (core + lobe) * input.alpha);
-        half3 snowColor = half3(0.94, 0.975, 1.0);
-        return half4(snowColor * half(alpha), half(alpha));
-    }
-    """
-
-    var isRendererReady: Bool { pipeline != nil && commandQueue != nil }
-
-    init(frame: CGRect, device: MTLDevice) {
-        let library = try? device.makeLibrary(source: Self.spriteShader, options: nil)
-        let vertex = library?.makeFunction(name: "snowVertex")
-        let fragment = library?.makeFunction(name: "snowFragment")
-        let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.vertexFunction = vertex
-        descriptor.fragmentFunction = fragment
-        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        descriptor.colorAttachments[0].isBlendingEnabled = true
-        descriptor.colorAttachments[0].rgbBlendOperation = .add
-        descriptor.colorAttachments[0].alphaBlendOperation = .add
-        descriptor.colorAttachments[0].sourceRGBBlendFactor = .one
-        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        let pipelineState = (vertex != nil && fragment != nil) ? try? device.makeRenderPipelineState(descriptor: descriptor) : nil
-
-        pipeline = pipelineState
-        commandQueue = device.makeCommandQueue()
-        super.init(frame: frame, device: device)
-        colorPixelFormat = .bgra8Unorm
-        clearColor = MTLClearColorMake(0, 0, 0, 0)
-        framebufferOnly = true
-        isPaused = true
-        enableSetNeedsDisplay = false
-        wantsLayer = true
-        layer?.isOpaque = false
-        delegate = self
-    }
-
-    required init(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func update(particles: [SnowGPUInstance]) {
-        instanceCount = particles.count
-        guard !particles.isEmpty else { return }
-
-        if particles.count > bufferCapacity {
-            bufferCapacity = max(particles.count, max(64, bufferCapacity * 2))
-            particleBuffer = device?.makeBuffer(
-                length: MemoryLayout<SnowGPUInstance>.stride * bufferCapacity,
-                options: .storageModeShared
-            )
-        }
-
-        guard let particleBuffer else { return }
-        particles.withUnsafeBytes { source in
-            guard let address = source.baseAddress else { return }
-            particleBuffer.contents().copyMemory(from: address, byteCount: source.count)
-        }
-    }
-
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
-    func draw(in view: MTKView) {
-        guard let pipeline,
-              let commandQueue,
-              let pass = currentRenderPassDescriptor,
-              let drawable = currentDrawable,
-              let commandBuffer = commandQueue.makeCommandBuffer() else { return }
-
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].storeAction = .store
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
-        encoder.setRenderPipelineState(pipeline)
-
-        if instanceCount > 0, let particleBuffer {
-            var uniforms = SnowGPUUniforms(viewportSize: SIMD2<Float>(
-                Float(drawableSize.width),
-                Float(drawableSize.height)
+            let x = surface.left + (CGFloat(index) + 0.5) * binWidth
+            let y = surface.supportY + heights[index] * 0.64
+            output.particles.append(SnowGPUInstance(
+                cx: Float(x),
+                cy: Float(y),
+                hw: 1.3,
+                hh: 1.3,
+                rotation: 0,
+                alpha: Float(0.26 + sparkle * 0.5),
+                softness: 0.2
             ))
-            encoder.setVertexBuffer(particleBuffer, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<SnowGPUUniforms>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: instanceCount)
         }
-
-        encoder.endEncoding()
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
     }
 }

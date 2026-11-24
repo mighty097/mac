@@ -1,7 +1,10 @@
 import AppKit
 import CoreGraphics
+import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let settings = AppSettings.shared
+
     private var statusItem: NSStatusItem!
     private var overlays: [OverlayEntry] = []
     private var isSnowEnabled = true
@@ -10,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var toggleMenuItem: NSMenuItem!
     private var finderOnlyMenuItem: NSMenuItem!
+    private var dockAccessMenuItem: NSMenuItem!
+    private var launchAtLoginMenuItem: NSMenuItem!
     private var intensityMenuItems: [NSMenuItem] = []
     private var screenObserver: NSObjectProtocol?
     private var screenSleepObserver: NSObjectProtocol?
@@ -17,17 +22,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screensAreAsleep = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        isSnowEnabled = settings.isEnabled
+        finderOnlyEnabled = settings.finderOnly
+        intensity = settings.intensity
+
         buildStatusItem()
         rebuildOverlays()
-        setSnowEnabled(true)
+        setSnowEnabled(isSnowEnabled)
 
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.rebuildOverlays()
-            self?.setSnowEnabled(self?.isSnowEnabled ?? true)
+            guard let self else { return }
+            self.rebuildOverlays()
+            self.setSnowEnabled(self.isSnowEnabled)
         }
 
         let workspaceCenter = NSWorkspace.shared.notificationCenter
@@ -54,11 +64,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         if let screenSleepObserver { workspaceCenter.removeObserver(screenSleepObserver) }
         if let screenWakeObserver { workspaceCenter.removeObserver(screenWakeObserver) }
-        overlays.forEach {
-            $0.backgroundView.stop()
-            $0.foregroundView.stop()
+        for entry in overlays {
+            entry.backgroundView.stop()
+            entry.foregroundView.stop()
         }
     }
+
+    // MARK: Menu
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -81,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         finderOnlyMenuItem = NSMenuItem(title: "Только Finder", action: #selector(toggleFinderOnly), keyEquivalent: "")
         finderOnlyMenuItem.target = self
-        finderOnlyMenuItem.state = .off
+        finderOnlyMenuItem.state = finderOnlyEnabled ? .on : .off
         menu.addItem(finderOnlyMenuItem)
         menu.addItem(.separator())
 
@@ -97,8 +109,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         intensityRoot.submenu = intensityMenu
         menu.addItem(intensityRoot)
-
         menu.addItem(.separator())
+
+        dockAccessMenuItem = NSMenuItem(title: "Снег на Dock: разрешить доступ…", action: #selector(openAccessibilitySettings), keyEquivalent: "")
+        dockAccessMenuItem.target = self
+        menu.addItem(dockAccessMenuItem)
+
+        launchAtLoginMenuItem = NSMenuItem(title: "Запускать при входе", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        launchAtLoginMenuItem.target = self
+        menu.addItem(launchAtLoginMenuItem)
+        menu.addItem(.separator())
+
         let quitItem = NSMenuItem(title: "Выйти", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -111,14 +132,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for item in intensityMenuItems {
             item.state = item.tag == intensity.rawValue ? .on : .off
         }
+
+        if WindowGeometryProvider.isAccessibilityTrusted {
+            dockAccessMenuItem.title = "Снег на Dock: доступ разрешён"
+            dockAccessMenuItem.state = .on
+            dockAccessMenuItem.isEnabled = false
+        } else {
+            dockAccessMenuItem.title = "Снег на Dock: разрешить доступ…"
+            dockAccessMenuItem.state = .off
+            dockAccessMenuItem.isEnabled = true
+        }
+
+        launchAtLoginMenuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
+    // MARK: Overlay windows
+
     private func rebuildOverlays() {
-        overlays.forEach {
-            $0.backgroundWindow.orderOut(nil)
-            $0.foregroundWindow.orderOut(nil)
-            $0.backgroundView.stop()
-            $0.foregroundView.stop()
+        for entry in overlays {
+            entry.backgroundWindow.orderOut(nil)
+            entry.foregroundWindow.orderOut(nil)
+            entry.backgroundView.stop()
+            entry.foregroundView.stop()
         }
         overlays.removeAll()
 
@@ -160,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.backgroundColor = .clear
         window.hasShadow = false
         window.ignoresMouseEvents = true
+        window.isReleasedWhenClosed = false
         window.collectionBehavior = [
             .canJoinAllSpaces,
             .stationary,
@@ -172,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setSnowEnabled(_ enabled: Bool) {
         isSnowEnabled = enabled
+        settings.isEnabled = enabled
         for entry in overlays {
             entry.backgroundView.intensity = intensity
             entry.foregroundView.intensity = intensity
@@ -209,6 +246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: Actions
+
     @objc private func toggleSnow() {
         setSnowEnabled(!isSnowEnabled)
     }
@@ -221,6 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleFinderOnly() {
         finderOnlyEnabled.toggle()
+        settings.finderOnly = finderOnlyEnabled
         for entry in overlays {
             entry.foregroundView.finderOnly = finderOnlyEnabled
             entry.foregroundView.clearSnow()
@@ -231,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectIntensity(_ sender: NSMenuItem) {
         guard let selected = SnowIntensity(rawValue: sender.tag) else { return }
         intensity = selected
+        settings.intensity = selected
         for entry in overlays {
             entry.backgroundView.intensity = selected
             entry.foregroundView.intensity = selected
@@ -238,6 +279,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for item in intensityMenuItems {
             item.state = item.tag == selected.rawValue ? .on : .off
         }
+    }
+
+    /// Snow on the Dock needs the Accessibility permission, because only that API reports the Dock's real size.
+    @objc private func openAccessibilitySettings() {
+        WindowGeometryProvider.requestAccessibilityAccess()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Не удалось изменить автозапуск"
+            alert.informativeText = "Приложение должно лежать в «Программы» (или в другой постоянной папке). Ошибка: \(error.localizedDescription)"
+            alert.runModal()
+        }
+        launchAtLoginMenuItem.state = service.status == .enabled ? .on : .off
     }
 
     @objc private func quit() {

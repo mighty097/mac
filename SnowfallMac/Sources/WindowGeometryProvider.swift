@@ -73,6 +73,18 @@ enum WindowGeometryProvider {
         return results
     }
 
+    // MARK: Accessibility permission (needed only for the Dock ledge)
+
+    static var isAccessibilityTrusted: Bool {
+        AXIsProcessTrusted()
+    }
+
+    /// Shows the system prompt that leads to System Settings → Privacy & Security → Accessibility.
+    static func requestAccessibilityAccess() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
     // MARK: Dock geometry via Accessibility
 
     private static var dockAXCacheDate: TimeInterval = 0
