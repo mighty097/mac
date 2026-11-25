@@ -11,6 +11,9 @@
 		A10000000000000000000003 /* SnowIntensity.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* SnowIntensity.swift */; };
 		A10000000000000000000004 /* SnowOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000004 /* SnowOverlayView.swift */; };
 		A10000000000000000000005 /* WindowGeometryProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000005 /* WindowGeometryProvider.swift */; };
+		A10000000000000000000011 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* AppSettings.swift */; };
+		A10000000000000000000012 /* SnowRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* SnowRenderer.swift */; };
+		A10000000000000000000013 /* SurfaceTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* SurfaceTracker.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +25,9 @@
 		B10000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B10000000000000000000007 /* SnowfallMac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SnowfallMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		B10000000000000000000011 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		B10000000000000000000012 /* SnowRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnowRenderer.swift; sourceTree = "<group>"; };
+		B10000000000000000000013 /* SurfaceTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceTracker.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -55,6 +61,9 @@
 				B10000000000000000000003 /* SnowIntensity.swift */,
 				B10000000000000000000004 /* SnowOverlayView.swift */,
 				B10000000000000000000005 /* WindowGeometryProvider.swift */,
+				B10000000000000000000011 /* AppSettings.swift */,
+				B10000000000000000000012 /* SnowRenderer.swift */,
+				B10000000000000000000013 /* SurfaceTracker.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -119,6 +128,9 @@
 				A10000000000000000000003 /* SnowIntensity.swift in Sources */,
 				A10000000000000000000004 /* SnowOverlayView.swift in Sources */,
 				A10000000000000000000005 /* WindowGeometryProvider.swift in Sources */,
+				A10000000000000000000011 /* AppSettings.swift in Sources */,
+				A10000000000000000000012 /* SnowRenderer.swift in Sources */,
+				A10000000000000000000013 /* SurfaceTracker.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

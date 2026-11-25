@@ -30,13 +30,6 @@ enum SnowIntensity: Int, CaseIterable {
         }
     }
 
-    var maximumPileHeight: CGFloat {
-        switch self {
-        case .light: return 14
-        case .normal: return 24
-        case .heavy: return 38
-        }
-    }
 
     var fallSpeed: ClosedRange<CGFloat> {
         switch self {

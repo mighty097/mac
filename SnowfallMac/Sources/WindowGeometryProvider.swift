@@ -10,7 +10,7 @@ struct WindowSurfaceInfo {
 }
 
 enum WindowGeometryProvider {
-    static func visibleWindowSurfaces(on screen: NSScreen) -> [WindowSurfaceInfo] {
+    static func visibleWindowSurfaces(on screen: NSScreen, includeDesktopWidgets: Bool = false) -> [WindowSurfaceInfo] {
         guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
             return []
         }
@@ -20,11 +20,29 @@ enum WindowGeometryProvider {
         let cocoaDisplayFrame = screen.frame
         let ownPID = ProcessInfo.processInfo.processIdentifier
 
-        guard let entries = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return []
+        guard let regularEntries = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return [] }
+        var entries = regularEntries
+        if includeDesktopWidgets,
+           let allEntries = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] {
+            let knownIDs = Set(regularEntries.compactMap {
+                ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            })
+            let widgetEntries = allEntries.filter { entry in
+                let owner = (entry[kCGWindowOwnerName as String] as? String ?? "").lowercased()
+                let isWidgetHost = owner.contains("notificationcenter")
+                    || owner.contains("widgetkit")
+                    || owner.contains("widget")
+                let id = (entry[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0
+                guard isWidgetHost, id != 0, !knownIDs.contains(id),
+                      let raw = entry[kCGWindowBounds as String] as? NSDictionary,
+                      let rect = CGRect(dictionaryRepresentation: raw as CFDictionary) else { return false }
+                return rect.width >= 100 && rect.height >= 60
+                    && rect.width < quartzDisplayFrame.width * 0.82
+                    && rect.height < quartzDisplayFrame.height * 0.82
+            }
+            entries.append(contentsOf: widgetEntries)
         }
 
         var results: [WindowSurfaceInfo] = []
@@ -63,14 +81,29 @@ enum WindowGeometryProvider {
             let windowID = (entry[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0
             guard windowID != 0 else { continue }
             let ownerName = entry[kCGWindowOwnerName as String] as? String ?? "Unknown"
-
+            // Keep the complete window frame in display-local coordinates.
+            // Clipping the simulation surface here changes its width while the
+            // window crosses a display edge and makes the snow profile resample.
+            // The GPU clips drawing to the overlay bounds naturally.
             results.append(WindowSurfaceInfo(
                 windowID: windowID,
                 ownerName: ownerName,
-                frame: clipped.offsetBy(dx: -cocoaDisplayFrame.minX, dy: -cocoaDisplayFrame.minY)
+                frame: cocoaRect.offsetBy(dx: -cocoaDisplayFrame.minX, dy: -cocoaDisplayFrame.minY)
             ))
         }
         return results
+    }
+
+    // MARK: Accessibility permission (needed only for the Dock ledge)
+
+    static var isAccessibilityTrusted: Bool {
+        AXIsProcessTrusted()
+    }
+
+    /// Shows the system prompt that leads to System Settings → Privacy & Security → Accessibility.
+    static func requestAccessibilityAccess() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
     }
 
     // MARK: Dock geometry via Accessibility
@@ -79,18 +112,33 @@ enum WindowGeometryProvider {
     private static var dockAXCacheWasRead = false
     private static var cachedDockAXFrame: CGRect?
 
+    /// Set whenever `dockSurfaceFrame` fails, so the menu's diagnostic item can show why
+    /// instead of just "доступ разрешён" while no snow actually appears on the Dock.
+    private(set) static var lastDockDetectionFailure: String?
+
     /// Returns the bottom Dock panel as a rectangle local to this display.
     /// The AXList describes the actual Dock strip; full-screen Dock helper
     /// windows from CGWindowList are intentionally not used as geometry.
     static func dockSurfaceFrame(on screen: NSScreen) -> CGRect? {
-        guard let axFrame = currentDockAXFrame(),
-              let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+        guard AXIsProcessTrusted() else {
+            lastDockDetectionFailure = "нет разрешения Универсального доступа"
+            return nil
+        }
+        guard let axFrame = currentDockAXFrame() else {
+            lastDockDetectionFailure = "не нашли панель Dock через Accessibility (AXList)"
+            return nil
+        }
+        guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            lastDockDetectionFailure = "нет номера экрана"
             return nil
         }
 
         let displayID = CGDirectDisplayID(screenNumber.uint32Value)
         let quartzDisplayFrame = CGDisplayBounds(displayID)
-        guard quartzDisplayFrame.width > 0, quartzDisplayFrame.height > 0 else { return nil }
+        guard quartzDisplayFrame.width > 0, quartzDisplayFrame.height > 0 else {
+            lastDockDetectionFailure = "пустые границы экрана"
+            return nil
+        }
 
         // kAXPositionAttribute and CGDisplayBounds both use global top-left
         // coordinates. SnowfallMac's NSView uses local bottom-left coordinates.
@@ -102,19 +150,25 @@ enum WindowGeometryProvider {
         )
         let displayBounds = CGRect(origin: .zero, size: screen.frame.size)
         let clipped = localFrame.intersection(displayBounds)
-        guard !clipped.isNull, !clipped.isEmpty else { return nil }
-
-        // This implementation intentionally recognizes a horizontal Dock at
-        // the bottom edge. It rejects the full-display helper window and other
-        // unrelated AX lists. Side/top Dock layouts can be added separately.
-        guard clipped.minY <= 100,
-              clipped.maxY <= 220,
-              clipped.width >= max(160, displayBounds.width * 0.15),
-              clipped.width <= displayBounds.width * 0.95,
-              clipped.height >= 28,
-              clipped.height <= 180 else {
+        guard !clipped.isNull, !clipped.isEmpty else {
+            lastDockDetectionFailure = "Dock не пересекается с этим экраном (другой монитор?)"
             return nil
         }
+
+        // Recognize a horizontal Dock at the bottom edge by shape and position instead of
+        // fixed pixel caps: those broke on some Retina/4K setups and with larger Dock icon
+        // sizes or magnification, where the panel is taller or sits higher than 220pt/180pt
+        // but is still clearly "much wider than tall, low on the screen".
+        let aspectRatio = clipped.width / max(1, clipped.height)
+        let verticalCenterFraction = clipped.midY / max(1, displayBounds.height)
+        guard clipped.width >= max(140, displayBounds.width * 0.08),
+              clipped.height >= 24,
+              aspectRatio >= 2.2,
+              verticalCenterFraction <= 0.45 else {
+            lastDockDetectionFailure = "геометрия Dock не прошла проверку (w=\(Int(clipped.width)) h=\(Int(clipped.height)))"
+            return nil
+        }
+        lastDockDetectionFailure = nil
         return clipped
     }
 
@@ -173,9 +227,8 @@ enum WindowGeometryProvider {
             if let role = readAttribute(element, "AXRole") as? String,
                role == "AXList",
                let frame = readFrame(element),
-               frame.width >= 160,
-               frame.height >= 28,
-               frame.height <= 180 {
+               frame.width >= 140,
+               frame.height >= 24 {
                 candidates.append(frame)
             }
 

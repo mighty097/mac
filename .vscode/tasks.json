@@ -1,0 +1,70 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "SnowfallMac: собрать приложение",
+      "type": "shell",
+      "command": "./build_app.sh",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": "$swiftc",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "SnowfallMac: собрать и запустить",
+      "type": "shell",
+      "command": "./build_app.sh --run",
+      "problemMatcher": "$swiftc",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "SnowfallMac: проверить компиляцию",
+      "type": "shell",
+      "command": "swift build",
+      "problemMatcher": "$swiftc",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "SnowfallMac: остановить приложение",
+      "type": "shell",
+      "command": "pkill -x Snowfall || pkill -x SnowfallMac || true",
+      "problemMatcher": []
+    },
+    {
+      "label": "SnowfallMac: проверить исходники и настройки",
+      "type": "shell",
+      "command": "./scripts/validate.sh",
+      "problemMatcher": "$swiftc",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "SnowfallMac: закрепить разрешение на Dock (один раз)",
+      "type": "shell",
+      "command": "./scripts/create_dev_cert.sh",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ]
+}
