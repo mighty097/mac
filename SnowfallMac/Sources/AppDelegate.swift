@@ -10,10 +10,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isSnowEnabled = true
     private var finderOnlyEnabled = false
     private var intensity: SnowIntensity = .normal
+    private var windStrength: Double = 1.0
+    private var windDirection: Int = 0
+    private var accumulateOnWindows = true
+    private var behindWindowsOnly = false
+    private var includeDesktopWidgets = false
+    private var selectedDisplayIDs: [UInt32] = []
 
     private var toggleMenuItem: NSMenuItem!
     private var finderOnlyMenuItem: NSMenuItem!
+    private var accumulateMenuItem: NSMenuItem!
+    private var behindWindowsMenuItem: NSMenuItem!
+    private var widgetsMenuItem: NSMenuItem!
+    private var displayMenuItems: [NSMenuItem] = []
+    private var displaysMenu: NSMenu?
+    private var windMenuItems: [NSMenuItem] = []
     private var dockAccessMenuItem: NSMenuItem!
+    private var snowblowerMenuItem: NSMenuItem!
+    private var dogMenuItem: NSMenuItem!
     private var launchAtLoginMenuItem: NSMenuItem!
     private var intensityMenuItems: [NSMenuItem] = []
     private var screenObserver: NSObjectProtocol?
@@ -25,6 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isSnowEnabled = settings.isEnabled
         finderOnlyEnabled = settings.finderOnly
         intensity = settings.intensity
+        windStrength = settings.windStrength
+        windDirection = settings.windDirection
+        accumulateOnWindows = settings.accumulateOnWindows
+        behindWindowsOnly = settings.behindWindowsOnly
+        includeDesktopWidgets = settings.includeDesktopWidgets
+        selectedDisplayIDs = settings.selectedDisplayIDs
 
         buildStatusItem()
         rebuildOverlays()
@@ -36,7 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            let connected = Set(NSScreen.screens.compactMap { screen in
+                (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            })
+            self.selectedDisplayIDs = self.selectedDisplayIDs.filter { connected.contains($0) }
+            self.settings.selectedDisplayIDs = self.selectedDisplayIDs
             self.rebuildOverlays()
+            self.refreshDisplayMenu()
             self.setSnowEnabled(self.isSnowEnabled)
         }
 
@@ -91,10 +117,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clearItem.target = self
         menu.addItem(clearItem)
 
+        snowblowerMenuItem = NSMenuItem(title: "Вызвать снегоуборщик — убрать самый большой сугроб", action: #selector(callSnowblower), keyEquivalent: "")
+        snowblowerMenuItem.target = self
+        menu.addItem(snowblowerMenuItem)
+
+        dogMenuItem = NSMenuItem(title: "Позвать собаку сейчас (проверка)", action: #selector(callDog), keyEquivalent: "")
+        dogMenuItem.target = self
+        menu.addItem(dogMenuItem)
+
+        let removeSnowmenItem = NSMenuItem(title: "Убрать снеговиков", action: #selector(removeSnowmen), keyEquivalent: "")
+        removeSnowmenItem.target = self
+        menu.addItem(removeSnowmenItem)
+
         finderOnlyMenuItem = NSMenuItem(title: "Только Finder", action: #selector(toggleFinderOnly), keyEquivalent: "")
         finderOnlyMenuItem.target = self
         finderOnlyMenuItem.state = finderOnlyEnabled ? .on : .off
         menu.addItem(finderOnlyMenuItem)
+
+        accumulateMenuItem = NSMenuItem(title: "Не накапливать на окнах", action: #selector(toggleAccumulateOnWindows), keyEquivalent: "")
+        accumulateMenuItem.target = self
+        menu.addItem(accumulateMenuItem)
+
+        behindWindowsMenuItem = NSMenuItem(title: "Только за окнами", action: #selector(toggleBehindWindowsOnly), keyEquivalent: "")
+        behindWindowsMenuItem.target = self
+        menu.addItem(behindWindowsMenuItem)
+
+        widgetsMenuItem = NSMenuItem(title: "Виджеты рабочего стола (экспериментально)", action: #selector(toggleDesktopWidgets), keyEquivalent: "")
+        widgetsMenuItem.target = self
+        menu.addItem(widgetsMenuItem)
+
+        let windRoot = NSMenuItem(title: "Ветер", action: nil, keyEquivalent: "")
+        let windMenu = NSMenu()
+        let directionOptions: [(String, Int, Int)] = [("Переменный", 0, 100), ("Слева направо", 2, 102), ("Справа налево", -2, 98)]
+        for (title, value, tag) in directionOptions {
+            let item = NSMenuItem(title: title, action: #selector(selectWindDirection(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = tag
+            item.state = value == windDirection ? .on : .off
+            windMenu.addItem(item)
+            windMenuItems.append(item)
+        }
+        windMenu.addItem(.separator())
+        for (title, value) in [("Штиль", 0.0), ("Слабый", 0.5), ("Обычный", 1.0), ("Сильный", 1.5), ("Шквалы", 2.0)] {
+            let item = NSMenuItem(title: title, action: #selector(selectWindStrength(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = 200 + Int(value * 10)
+            item.state = abs(windStrength - value) < 0.01 ? .on : .off
+            windMenu.addItem(item)
+            windMenuItems.append(item)
+        }
+        windRoot.submenu = windMenu
+        menu.addItem(windRoot)
+
+        let displaysRoot = NSMenuItem(title: "Экраны", action: nil, keyEquivalent: "")
+        displaysMenu = NSMenu()
+        refreshDisplayMenu()
+        displaysRoot.submenu = displaysMenu
+        menu.addItem(displaysRoot)
         menu.addItem(.separator())
 
         let intensityRoot = NSMenuItem(title: "Интенсивность", action: nil, keyEquivalent: "")
@@ -126,17 +205,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
+    private func refreshDisplayMenu() {
+        guard let displaysMenu else { return }
+        displaysMenu.removeAllItems()
+        displayMenuItems.removeAll()
+        for screen in NSScreen.screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+            let id = number.uint32Value
+            let item = NSMenuItem(title: screen.localizedName, action: #selector(toggleDisplay(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = Int(id)
+            item.state = selectedDisplayIDs.isEmpty || selectedDisplayIDs.contains(id) ? .on : .off
+            displaysMenu.addItem(item)
+            displayMenuItems.append(item)
+        }
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         toggleMenuItem.title = isSnowEnabled ? "Остановить снег" : "Включить снег"
         finderOnlyMenuItem.state = finderOnlyEnabled ? .on : .off
+        accumulateMenuItem.state = accumulateOnWindows ? .off : .on
+        behindWindowsMenuItem.state = behindWindowsOnly ? .on : .off
+        widgetsMenuItem.state = includeDesktopWidgets ? .on : .off
+        for item in displayMenuItems {
+            let id = UInt32(item.tag)
+            item.state = selectedDisplayIDs.isEmpty || selectedDisplayIDs.contains(id) ? .on : .off
+        }
+        for item in windMenuItems {
+            if item.tag >= 200 && item.tag <= 220 {
+                item.state = abs(windStrength - Double(item.tag - 200) / 10.0) < 0.01 ? .on : .off
+            } else {
+                item.state = item.tag == 100 + windDirection ? .on : .off
+            }
+        }
         for item in intensityMenuItems {
             item.state = item.tag == intensity.rawValue ? .on : .off
         }
 
         if WindowGeometryProvider.isAccessibilityTrusted {
-            dockAccessMenuItem.title = "Снег на Dock: доступ разрешён"
-            dockAccessMenuItem.state = .on
-            dockAccessMenuItem.isEnabled = false
+            // Разрешение может числиться включённым, а сама панель Dock при этом
+            // не определяться (смена подписи при пересборке, нестандартная геометрия
+            // Dock и т.п.) — поэтому здесь дополнительно проверяем реальное обнаружение,
+            // а не только флаг доверия.
+            let dockFound = NSScreen.main.flatMap { WindowGeometryProvider.dockSurfaceFrame(on: $0) } != nil
+            if dockFound {
+                dockAccessMenuItem.title = "Снег на Dock: доступ разрешён"
+                dockAccessMenuItem.state = .on
+                dockAccessMenuItem.isEnabled = false
+            } else {
+                let reason = WindowGeometryProvider.lastDockDetectionFailure ?? "причина неизвестна"
+                dockAccessMenuItem.title = "Снег на Dock: разрешение есть, Dock не найден (\(reason))"
+                dockAccessMenuItem.state = .off
+                dockAccessMenuItem.isEnabled = true
+            }
         } else {
             dockAccessMenuItem.title = "Снег на Dock: разрешить доступ…"
             dockAccessMenuItem.state = .off
@@ -158,12 +279,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlays.removeAll()
 
         for screen in NSScreen.screens {
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+            let displayID = screenNumber.uint32Value
+            if !selectedDisplayIDs.isEmpty && !selectedDisplayIDs.contains(displayID) { continue }
             let localFrame = NSRect(origin: .zero, size: screen.frame.size)
             let backgroundView = SnowOverlayView(frame: localFrame, screen: screen, renderLayer: .background)
             let foregroundView = SnowOverlayView(frame: localFrame, screen: screen, renderLayer: .foreground)
             backgroundView.intensity = intensity
             foregroundView.intensity = intensity
             foregroundView.finderOnly = finderOnlyEnabled
+            foregroundView.accumulateOnWindows = accumulateOnWindows
+            foregroundView.includeDesktopWidgets = includeDesktopWidgets
+            backgroundView.windStrength = CGFloat(windStrength)
+            foregroundView.windStrength = CGFloat(windStrength)
+            backgroundView.windDirection = windDirection
+            foregroundView.windDirection = windDirection
 
             let backgroundWindow = makeOverlayWindow(screen: screen, view: backgroundView)
             let foregroundWindow = makeOverlayWindow(screen: screen, view: foregroundView)
@@ -171,8 +301,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Keep the distant snow between desktop icons and regular application windows.
             let desktopLevel = Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
             backgroundWindow.level = NSWindow.Level(rawValue: desktopLevel)
-            // Above the Dock and application windows, but below the system menu bar.
-            foregroundWindow.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
+            // Above normal application windows but below the Dock. Snow and the
+            // snowblower are therefore visible through the translucent Dock glass
+            // instead of being painted on top of the panel and its icons.
+            foregroundWindow.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.normalWindow)) + 1)
 
             overlays.append(OverlayEntry(
                 backgroundWindow: backgroundWindow,
@@ -216,9 +348,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             if enabled && !screensAreAsleep {
                 entry.backgroundWindow.orderFrontRegardless()
-                entry.foregroundWindow.orderFrontRegardless()
                 entry.backgroundView.start()
-                entry.foregroundView.start()
+                if behindWindowsOnly {
+                    entry.foregroundWindow.orderOut(nil)
+                    entry.foregroundView.stop()
+                } else {
+                    entry.foregroundWindow.orderFrontRegardless()
+                    entry.foregroundView.start()
+                }
             } else {
                 entry.backgroundView.stop()
                 entry.foregroundView.stop()
@@ -239,9 +376,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 entry.foregroundWindow.orderOut(nil)
             } else {
                 entry.backgroundWindow.orderFrontRegardless()
-                entry.foregroundWindow.orderFrontRegardless()
                 entry.backgroundView.start()
-                entry.foregroundView.start()
+                if behindWindowsOnly {
+                    entry.foregroundWindow.orderOut(nil)
+                    entry.foregroundView.stop()
+                } else {
+                    entry.foregroundWindow.orderFrontRegardless()
+                    entry.foregroundView.start()
+                }
             }
         }
     }
@@ -255,6 +397,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func clearSnow() {
         for entry in overlays {
             entry.foregroundView.clearSnow()
+        }
+    }
+
+    @objc private func callSnowblower() {
+        for entry in overlays {
+            entry.foregroundView.callSnowblower()
+        }
+    }
+
+    @objc private func callDog() {
+        SnowOverlayView.callDogNow()
+    }
+
+    @objc private func removeSnowmen() {
+        for entry in overlays {
+            entry.foregroundView.removeAllSnowmen()
+        }
+    }
+
+    @objc private func toggleAccumulateOnWindows() {
+        accumulateOnWindows.toggle()
+        settings.accumulateOnWindows = accumulateOnWindows
+        for entry in overlays { entry.foregroundView.accumulateOnWindows = accumulateOnWindows }
+        accumulateMenuItem.state = accumulateOnWindows ? .off : .on
+    }
+
+    @objc private func toggleDesktopWidgets() {
+        includeDesktopWidgets.toggle()
+        settings.includeDesktopWidgets = includeDesktopWidgets
+        for entry in overlays { entry.foregroundView.includeDesktopWidgets = includeDesktopWidgets }
+        // Refresh the tracked geometry immediately so widget-host windows can appear.
+        rebuildOverlays()
+        setSnowEnabled(isSnowEnabled)
+        widgetsMenuItem.state = includeDesktopWidgets ? .on : .off
+    }
+
+    @objc private func toggleBehindWindowsOnly() {
+        behindWindowsOnly.toggle()
+        settings.behindWindowsOnly = behindWindowsOnly
+        for entry in overlays {
+            if behindWindowsOnly {
+                entry.foregroundView.stop()
+                entry.foregroundWindow.orderOut(nil)
+            } else if isSnowEnabled && !screensAreAsleep {
+                entry.foregroundWindow.orderFrontRegardless()
+                entry.foregroundView.start()
+            }
+        }
+        behindWindowsMenuItem.state = behindWindowsOnly ? .on : .off
+    }
+
+    @objc private func selectWindDirection(_ sender: NSMenuItem) {
+        windDirection = sender.tag - 100
+        settings.windDirection = windDirection
+        for entry in overlays {
+            entry.backgroundView.windDirection = windDirection
+            entry.foregroundView.windDirection = windDirection
+        }
+        for item in windMenuItems where item.tag >= 98 && item.tag <= 102 {
+            item.state = item.tag == 100 + windDirection ? .on : .off
+        }
+    }
+
+    @objc private func selectWindStrength(_ sender: NSMenuItem) {
+        windStrength = Double(sender.tag - 200) / 10.0
+        settings.windStrength = windStrength
+        for entry in overlays {
+            entry.backgroundView.windStrength = CGFloat(windStrength)
+            entry.foregroundView.windStrength = CGFloat(windStrength)
+        }
+        for item in windMenuItems where item.tag >= 200 && item.tag <= 220 {
+            item.state = item.tag == sender.tag ? .on : .off
+        }
+    }
+
+    @objc private func toggleDisplay(_ sender: NSMenuItem) {
+        let id = UInt32(sender.tag)
+        let allIDs = NSScreen.screens.compactMap { screen -> UInt32? in
+            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+        }
+        var selected = selectedDisplayIDs.isEmpty ? allIDs : selectedDisplayIDs
+        if selected.contains(id) {
+            if selected.count > 1 { selected.removeAll { $0 == id } }
+        } else {
+            selected.append(id)
+        }
+        selectedDisplayIDs = selected.count == allIDs.count ? [] : selected
+        settings.selectedDisplayIDs = selectedDisplayIDs
+        rebuildOverlays()
+        setSnowEnabled(isSnowEnabled)
+        for item in displayMenuItems {
+            let displayID = UInt32(item.tag)
+            item.state = selectedDisplayIDs.isEmpty || selectedDisplayIDs.contains(displayID) ? .on : .off
         }
     }
 
@@ -287,6 +522,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
+        guard WindowGeometryProvider.isAccessibilityTrusted else { return }
+        let dockFound = NSScreen.main.flatMap { WindowGeometryProvider.dockSurfaceFrame(on: $0) } != nil
+        guard !dockFound else { return }
+        let alert = NSAlert()
+        alert.messageText = "Разрешение есть, но Dock не найден"
+        alert.informativeText = """
+        Доступ в Универсальном доступе включён, но приложение подписано заново при каждой пересборке — \
+        macOS иногда сбрасывает разрешение именно из-за этого. В списке в Настройках удали Snowfall \
+        (кнопка «–») и добавь заново (кнопка «+», выбери Snowfall.app), либо один раз выполни \
+        ./scripts/create_dev_cert.sh — тогда подпись перестанет меняться между сборками и разрешение \
+        перестанет слетать. Если это не помогло — на этом Mac нестандартная раскладка Dock; напиши, \
+        что показывает пункт меню «Снег на Dock» после этого.
+        """
+        alert.runModal()
     }
 
     @objc private func toggleLaunchAtLogin() {

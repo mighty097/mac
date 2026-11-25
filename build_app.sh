@@ -51,8 +51,20 @@ cp "$BIN" "$APP/Contents/MacOS/SnowfallMac"
 sed 's/\$(EXECUTABLE_NAME)/SnowfallMac/g' "$ROOT/SnowfallMac/Info.plist" > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Ad-hoc подпись: аккаунт Apple Developer не нужен.
-codesign --force --deep --sign - "$APP"
+# Если есть локальный стабильный сертификат (см. scripts/create_dev_cert.sh),
+# подписываем им — тогда разрешение на Dock в Универсальном доступе не слетает
+# при каждой пересборке. Иначе — ad-hoc подпись (аккаунт Apple Developer не нужен),
+# но после каждой пересборки разрешение придётся выдавать заново.
+DEV_CERT_NAME="SnowfallMac Local Dev"
+IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' -v n="$DEV_CERT_NAME" '$2==n {print $2; exit}')"
+if [[ -n "$IDENTITY" ]]; then
+  codesign --force --deep --sign "$IDENTITY" --timestamp=none "$APP"
+  echo "Подписано локальным сертификатом «$IDENTITY» — разрешение Dock переживёт пересборку."
+else
+  codesign --force --deep --sign - "$APP"
+  echo "Подписано ad-hoc. После каждой пересборки разрешение на Dock придётся выдавать заново."
+  echo "Чтобы это исправить один раз: ./scripts/create_dev_cert.sh"
+fi
 codesign --verify --deep --strict "$APP"
 echo "Архитектуры: $(lipo -archs "$APP/Contents/MacOS/SnowfallMac")"
 echo "Готово: $APP"
