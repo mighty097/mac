@@ -1427,10 +1427,17 @@ final class SnowOverlayView: NSView {
     /// Loose single snowballs are deliberately left alone.
     @discardableResult
     private func removeSnowman(at point: CGPoint) -> Bool {
-        guard let hit = snowballs
-            .map({ ball in (ball, hypot(ball.position.x - point.x, ball.position.y - point.y)) })
-            .filter({ $0.1 <= $0.0.radius * 0.92 + 2 })
-            .min(by: { $0.1 < $1.1 })?.0 else { return false }
+        // Written as an explicit loop, not a map/filter/min chain: the chained-closure
+        // tuple form made the Swift type-checker time out during Release (-O) builds.
+        var bestBall: RollingSnowball?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for ball in snowballs {
+            let distance = hypot(ball.position.x - point.x, ball.position.y - point.y)
+            guard distance <= ball.radius * 0.92 + 2, distance < bestDistance else { continue }
+            bestDistance = distance
+            bestBall = ball
+        }
+        guard let hit = bestBall else { return false }
 
         let hasChild = snowballs.contains { $0.stackedOn == hit.id }
         guard hit.stackedOn != nil || hasChild else { return false }
